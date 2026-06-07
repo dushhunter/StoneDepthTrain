@@ -1,0 +1,6 @@
+AGG absrel all mae 8.185 p95 31.77
+AGG composite all mae 34.764 p95 151.615
+AGG absrel inside mae 7.57 p95 28.074
+AGG composite inside mae 24.111 p95 81.233
+AGG absrel outside mae 8.23 p95 32.035
+AGG composite outside mae 35.541 p95 158.533

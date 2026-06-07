@@ -1,0 +1,90 @@
+# Neural sparse stone reconstruction (2024-2026 SOTA stack)
+#
+# Two install profiles:
+#   profile_cpu : everything except the GPU-only neural backbones. Lets
+#                 reconstruct_stone_3d_neural.py run in `auto` mode which
+#                 transparently falls back to the classical pipeline.
+#   profile_gpu : adds PARE-Net, RAP, NKSR, NoKSR, PointTransformerV3
+#                 (all of which require a CUDA toolchain to compile).
+#
+# Pinned versions are tested against CUDA 12.1 + PyTorch 2.2.2.
+#
+# ---------------------------------------------------------------------
+# profile_cpu (always installable)
+# ---------------------------------------------------------------------
+numpy==1.26.4
+scipy==1.15.3
+matplotlib==3.10.9
+pillow==12.2.0
+opencv-python-headless==4.9.0.80
+open3d==0.18.0
+markdown-pdf==1.13.1
+
+# CPU torch for development and code structure. On the GPU box, replace
+# with the CUDA 12.1 wheels:
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url \
+#     https://download.pytorch.org/whl/cu121
+torch==2.2.2
+
+# ---------------------------------------------------------------------
+# profile_gpu (CUDA 12.1 + 15GB VRAM required)
+# ---------------------------------------------------------------------
+# These are commented out by default because they fail to install on a
+# CPU-only host. Uncomment on the GPU box.
+#
+# # PointTransformerV3 backbone (segmentation).
+# # NOT pip-installable — clone and copy into a local `ptv3` package:
+# #   git clone https://github.com/Pointcept/PointTransformerV3.git /tmp/PointTransformerV3
+# #   mkdir -p ptv3 && touch ptv3/__init__.py
+# #   cp /tmp/PointTransformerV3/model.py ptv3/
+# #   cp -r /tmp/PointTransformerV3/serialization ptv3/
+# spconv-cu121==2.3.6
+# timm einops addict
+#
+# # PARE-Net pairwise registration — repo OK: https://github.com/yaorz97/PARENet
+# # Install CUDA torch FIRST. Upstream package name is ``pareconv`` (not ``parenet``):
+# #   git clone https://github.com/yaorz97/PARENet.git /tmp/PARENet && cd /tmp/PARENet
+# #   pip install -r requirements.txt && pip install .
+# # Our loader expects ``parenet.pipeline.PARENetPipeline`` — may need a project wrapper
+# # around upstream experiments/3DMatch (not a one-line pip egg).
+#
+# # GeoTransformer pairwise fallback — repo OK: https://github.com/qinzheng93/GeoTransformer
+# # Install CUDA torch FIRST, then:
+# #   git clone https://github.com/qinzheng93/GeoTransformer.git /tmp/GeoTransformer
+# #   cd /tmp/GeoTransformer && pip install -r requirements.txt && pip install .
+# # Or: pip install git+https://github.com/qinzheng93/GeoTransformer.git@main#egg=geotransformer
+# # (builds CUDA extension; can fail without nvcc / matching torch).
+#
+# # RAP multi-view registration (replaces SGHR + MinkowskiEngine).
+# # Pure PyTorch transformer + flow matching — NO sparse-conv dependency.
+# # Repo: https://github.com/PRBonn/RAP  (MIT licence)
+# # Reference: Pan et al., NeurIPS 2025.
+# #   git clone https://github.com/PRBonn/RAP.git /tmp/RAP
+# #   cd /tmp/RAP
+# #   conda create -n py310-rap python=3.10 -y && conda activate py310-rap
+# #   bash ./scripts/install.sh          # installs torch, hydra, etc.
+# #   bash ./scripts/download_weights_and_demo_data.sh
+# #   cp weights/rap_model.ckpt <your_models_dir>/rap_model.ckpt
+# # Extra pip deps (most already pulled by install.sh):
+# hydra-core>=1.3
+# lightning>=2.0
+# natsort
+#
+# # NKSR neural surface reconstruction (NOT on PyPI; pre-built wheels expired).
+# # Official repo: https://github.com/nv-tlabs/nksr
+# # After torch 2.2.2+cu121 is installed:
+# #   git clone https://github.com/nv-tlabs/nksr.git /tmp/nksr
+# #   cd /tmp/nksr && pip install python-pycg matplotlib ninja GitPython pyntcloud plyfile
+# #   pip install --no-build-isolation package/
+# # Optional: try a wheel index matching your exact torch build (often 503/down):
+# #   pip install nksr -f https://nksr.huangjh.tech/whl/torch-2.2.0+cu121.html
+# # Newer upstream builds target PyTorch 2.7 + CUDA 12.8 (compile from source).
+#
+# # NoKSR ablation — NOT pip-installable; wrong repo was yi-li/NoKSR (does not exist).
+# # Official repo: https://github.com/theialab/noksr
+# # Manual setup (Hydra + PyTorch3D + NKSR above):
+# #   git clone https://github.com/theialab/noksr.git /tmp/noksr
+# #   cd /tmp/noksr && pip install -r requirements.txt && pip install serial-neighbor
+# #   export PYTHONPATH=/tmp/noksr:$PYTHONPATH
+# # Checkpoints: Google Drive link in theialab/noksr README (not GitHub releases).
+# # Surface stage: use --surface_model nksr unless NoKSR loader is wired to upstream eval API.
