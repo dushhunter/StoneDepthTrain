@@ -18,9 +18,9 @@ models
 NEW
 ptv3
 RAP*
-stone_syn_dataset
 stone_weights
 test*
 third_party
 venv
 volume_training_output
+stone_syn_dataset
