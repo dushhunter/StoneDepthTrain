@@ -1,0 +1,32 @@
+{
+  "train_stones": [
+    "stone_01",
+    "stone_02",
+    "stone_03",
+    "stone_04",
+    "stone_05",
+    "stone_06",
+    "stone_07",
+    "stone_08",
+    "stone_09",
+    "stone_10"
+  ],
+  "val_stones": [
+    "stone_11",
+    "stone_12"
+  ],
+  "best_checkpoint": "/home/dilan/msc_research/StoneVolMain/volume_training_output/checkpoints/best-epoch=029-val/loss=0.6086.ckpt",
+  "model_params": {
+    "encoder": 280384,
+    "seg_head": 41601,
+    "multi_view_attn": 5340928,
+    "flow_head": 125059,
+    "total": 5787972
+  },
+  "max_epochs": 50,
+  "lr": 0.001,
+  "loss_w_seg": 1.0,
+  "loss_w_flow": 1.0,
+  "freeze_encoder_after": -1,
+  "random_views_suffix": "_random_npy"
+}
