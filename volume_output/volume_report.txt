@@ -2,23 +2,23 @@
 StoneReconNet -- Volume Prediction Report
 ============================================================
 
-Input (turntable): stone_syn_dataset/stone_01_depth_npy/
+Input (turntable): stone_syn_dataset/stone_01_depth_npy
 Views:            120 (turntable=120, random=0)
 Total points:     491520
-Stone points:     109561 (22.3%)
+Stone points:     79348 (16.1%)
 Flow points:      512
 Upsampled points: 2048
 Flow ODE steps:   10
 
 --- Mesh Reconstruction ---
-Mesh vertices:    6527
-Mesh triangles:   12880
+Mesh vertices:    4619
+Mesh triangles:   9148
 Watertight:       False
 
-Volume:           0.000011 cm3
-                  0.01 mm3
+Volume:           0.000004 cm3
+                  0.00 mm3
 
-Inference time:   1.850 s
+Inference time:   2.205 s
 
 Output files:
   Upsampled PC:   stone_upsampled.ply
