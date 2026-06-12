@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 """Predict stone volume from sparse depth maps using StoneReconNet.
 
-Pipeline:
-  1. Model segments stone points and registers them via RPF flow (Euler ODE).
-  2. Poisson surface reconstruction creates a watertight mesh from the
-     registered stone point cloud.
-  3. Volume is computed geometrically from the mesh.
-
-No neural volume regression -- all volume computation is geometric.
-
-Supports both turntable views (fixed camera) and random views (arbitrary
-camera positions with poses loaded from poses.json).
+Sequential 3-stage pipeline (matching training):
+  1. Segment stone points from camera-space input (no pose applied).
+  2. Multi-view attention aligns stone features (learned, not analytical).
+  3. RPF flow head generates the complete stone point cloud.
+  4. Poisson surface reconstruction creates a watertight mesh.
+  5. Volume is computed geometrically from the mesh.
 
 Usage:
-    # Turntable views only:
     python predict_stone_volume.py \
         --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
-        --intrinsics splits/stone/intrinsics.txt \
-        --sequence stone_01 \
-        --checkpoint models/stone_recon_net.pt
-
-    # With additional random views:
-    python predict_stone_volume.py \
-        --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
-        --random_depth_dir stone_syn_dataset/stone_01_random_npy \
         --intrinsics splits/stone/intrinsics.txt \
         --sequence stone_01 \
         --checkpoint models/stone_recon_net.pt
 
 Output:
-    - stone_registered.ply        (registered stone point cloud)
+    - stone_flow.ply              (flow-generated complete stone cloud)
+    - stone_segmented.ply         (segmented stone points from input)
     - stone_mesh.ply              (watertight Poisson mesh)
     - volume_report.txt           (geometric volume and statistics)
     - prediction_result.json      (machine-readable results)
@@ -41,7 +29,6 @@ import argparse
 import json
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -59,7 +46,6 @@ from neural_pipeline.geometry import (  # noqa: E402
     make_pcd,
 )
 from volume_estimation.model import StoneReconNet, StoneReconNetConfig  # noqa: E402
-from volume_estimation.prepare_gt import _turntable_rotation_y  # noqa: E402
 
 LOG = logging.getLogger("predict_stone_volume")
 
@@ -76,41 +62,21 @@ def _load_depth_files(depth_dir: str) -> List[str]:
     return files
 
 
-def _load_poses_for_inference(depth_dir: str) -> Optional[Dict[int, np.ndarray]]:
-    """Load poses.json from a depth directory if it exists."""
-    poses_path = os.path.join(depth_dir, "poses.json")
-    if not os.path.isfile(poses_path):
-        return None
-    with open(poses_path, "r") as f:
-        data = json.load(f)
-    return {int(k): np.array(v, dtype=np.float64) for k, v in data.items()}
-
-
-def _extract_frame_index(filepath: str) -> int:
-    """Extract the numeric frame index from a depth filename like depth_0042.npy."""
-    stem = Path(filepath).stem
-    digits = "".join(c for c in stem if c.isdigit())
-    return int(digits) if digits else 0
-
-
 def _prepare_input(
     depth_files: List[str],
     intrinsics: Intrinsics,
     max_points_per_view: int = 4096,
     device: str = "cuda",
     random_depth_files: Optional[List[str]] = None,
-    random_poses: Optional[Dict[int, np.ndarray]] = None,
-    angle_per_frame_deg: float = 3.0,
 ) -> Tuple[Dict[str, torch.Tensor], np.ndarray, int, int]:
-    """Load depth files, back-project, apply poses, and prepare model input.
+    """Load depth files, back-project to camera space, and prepare model input.
 
-    Turntable views get the analytical Y-rotation (matching training).
-    Random views get the explicit 4x4 pose from poses.json.
-    This ensures the input distribution matches what the model saw in training.
+    No poses are applied -- raw camera-space points are fed to the model,
+    matching the sequential pipeline training where the model learns alignment.
 
     Returns:
         batch: Model input dict.
-        centroid: Point cloud centroid for de-centering.
+        centroid: Point cloud centroid used for centering (for de-centering output).
         n_turntable: Number of turntable views loaded.
         n_random: Number of random views loaded.
     """
@@ -129,11 +95,6 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
-
-        frame_idx = _extract_frame_index(path)
-        T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
-        R = T[:3, :3].astype(np.float32)
-        pts = (R @ pts.T).T
 
         if pts.shape[0] > max_points_per_view:
             choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
@@ -160,16 +121,6 @@ def _prepare_input(
 
             pts = pts_cam.astype(np.float32)
 
-            frame_idx = _extract_frame_index(path)
-            if random_poses and frame_idx in random_poses:
-                pose = random_poses[frame_idx]
-                R = pose[:3, :3].astype(np.float32)
-                t = pose[:3, 3].astype(np.float32)
-                pts = (R @ pts.T).T + t
-            else:
-                LOG.warning("No pose for random view %s (frame %d) -- using raw camera space",
-                            path, frame_idx)
-
             if pts.shape[0] > max_points_per_view:
                 choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
                 pts = pts[choice]
@@ -187,17 +138,65 @@ def _prepare_input(
     view_ids = np.concatenate(all_view_ids, axis=0)
 
     centroid = points.mean(axis=0)
+    points_tmp = points - centroid
+
+    N = points_tmp.shape[0]
+    batch_tmp = {
+        "points": torch.from_numpy(points_tmp.astype(np.float32)).unsqueeze(0).to(device),
+        "view_ids": torch.from_numpy(view_ids).unsqueeze(0).to(device),
+        "pad_mask": torch.zeros(1, N, dtype=torch.bool, device=device),
+        "n_points": torch.tensor([N], dtype=torch.int64, device=device),
+    }
+
+    if _seg_model_ref[0] is not None:
+        with torch.no_grad():
+            model = _seg_model_ref[0]
+            sa_xyz, sa_feat, _ = model.encoder(
+                batch_tmp["points"], mask=batch_tmp["pad_mask"],
+            )
+            seg_logits = model.seg_head(batch_tmp["points"], sa_xyz, sa_feat)
+            seg_probs = torch.sigmoid(seg_logits[0]).cpu().numpy()
+            stone_mask = seg_probs > 0.5
+            if stone_mask.sum() > 10:
+                stone_centroid = points[stone_mask].mean(axis=0)
+                LOG.info("Re-centering on stone points (%d pts, shift=%.4f)",
+                         stone_mask.sum(),
+                         np.linalg.norm(stone_centroid - centroid))
+                centroid = stone_centroid
+
     points = points - centroid
 
     N = points.shape[0]
     batch = {
-        "points": torch.from_numpy(points).unsqueeze(0).to(device),
+        "points": torch.from_numpy(points.astype(np.float32)).unsqueeze(0).to(device),
         "view_ids": torch.from_numpy(view_ids).unsqueeze(0).to(device),
         "pad_mask": torch.zeros(1, N, dtype=torch.bool, device=device),
         "n_points": torch.tensor([N], dtype=torch.int64, device=device),
     }
 
     return batch, centroid, n_turntable, n_random
+
+
+_seg_model_ref: List[Optional["StoneReconNet"]] = [None]
+
+
+def _clean_flow_cloud(points: np.ndarray, sigma_thresh: float = 2.0) -> np.ndarray:
+    """Remove outlier points from flow output using statistical filtering.
+
+    The flow can produce scattered outliers that break Poisson reconstruction.
+    This removes points farther than sigma_thresh standard deviations from the
+    centroid, producing a tighter cloud for meshing.
+    """
+    centroid = points.mean(axis=0)
+    dists = np.linalg.norm(points - centroid, axis=1)
+    threshold = dists.mean() + sigma_thresh * dists.std()
+    mask = dists < threshold
+    cleaned = points[mask]
+    n_removed = points.shape[0] - cleaned.shape[0]
+    if n_removed > 0:
+        LOG.info("Outlier removal: %d/%d points removed (%.1f%%)",
+                 n_removed, points.shape[0], 100 * n_removed / points.shape[0])
+    return cleaned
 
 
 def poisson_mesh(
@@ -219,14 +218,18 @@ def poisson_mesh(
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
 
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    LOG.info("After Open3D statistical outlier removal: %d points",
+             len(pcd.points))
+
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
     )
     pcd.orient_normals_towards_camera_location(
-        camera_location=np.array(points.mean(axis=0), dtype=np.float64)
+        camera_location=np.array(
+            np.asarray(pcd.points).mean(axis=0), dtype=np.float64
+        )
     )
-    # Flip normals to point outward (orient_normals_towards_camera puts them
-    # toward the centroid, so we invert)
     pcd.normals = o3d.utility.Vector3dVector(-np.asarray(pcd.normals))
 
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -277,26 +280,23 @@ def predict(
     flow_steps: int = 10,
     poisson_depth: int = 9,
 ) -> Dict:
-    """Full inference: segment -> Poisson mesh -> volume.
+    """Sequential inference: segment -> soft-gate -> align -> flow -> mesh -> volume.
 
-    The segmentation head identifies stone points from the full-resolution
-    input (tens of thousands of points). These segmented points are used
-    directly for Poisson reconstruction, giving a dense, high-quality mesh.
-
-    The flow head also produces a registered cloud at the SA3 level (128 pts)
-    which is saved for analysis, but the volume is computed from the much
-    denser segmented cloud.
+    The flow head generates the complete stone point cloud (Stage 3 output).
+    This is the primary source for Poisson mesh reconstruction.
+    Segmented input points are also saved for analysis.
     """
     model.eval()
 
-    registered_pts, seg_logits = model.sample_rectified_flow(
+    flow_pts_raw, upsampled_pts, seg_logits = model.sample_rectified_flow(
         batch, num_steps=flow_steps,
     )
 
     seg_probs = torch.sigmoid(seg_logits[0]).cpu().numpy()
     stone_mask_full = seg_probs > 0.5
 
-    flow_pts = registered_pts[0].cpu().numpy()
+    flow_pts = flow_pts_raw[0].cpu().numpy()
+    upsampled = upsampled_pts[0].cpu().numpy()
 
     input_pts = batch["points"][0].cpu().numpy()
     stone_pts_input = input_pts[stone_mask_full] + centroid
@@ -306,26 +306,28 @@ def predict(
     seg_ratio = n_stone / max(n_total, 1)
 
     results = {
-        "flow_registered_points": flow_pts,
+        "flow_points": flow_pts,
+        "upsampled_points": upsampled,
         "stone_points_input": stone_pts_input,
         "seg_probs": seg_probs,
         "n_stone_points": n_stone,
         "n_total_points": n_total,
         "n_flow_points": flow_pts.shape[0],
+        "n_upsampled_points": upsampled.shape[0],
         "seg_ratio": seg_ratio,
         "flow_steps": flow_steps,
     }
 
-    mesh_pts = stone_pts_input
-    if mesh_pts.shape[0] < 100:
-        LOG.warning("Too few stone points (%d) for mesh reconstruction", mesh_pts.shape[0])
+    mesh_pts = _clean_flow_cloud(upsampled, sigma_thresh=1.5)
+    if mesh_pts.shape[0] < 50:
+        LOG.warning("Too few upsampled points (%d) for mesh reconstruction", mesh_pts.shape[0])
         results["volume_cm3"] = 0.0
         results["volume_mm3"] = 0.0
         results["mesh"] = None
         return results
 
-    LOG.info("Building Poisson mesh from %d segmented stone points "
-             "(flow produced %d SA-level points)", mesh_pts.shape[0], flow_pts.shape[0])
+    LOG.info("Building Poisson mesh from %d upsampled points (flow: %d -> upsampled: %d)",
+             mesh_pts.shape[0], flow_pts.shape[0], upsampled.shape[0])
 
     mesh, pcd = poisson_mesh(mesh_pts, depth=poisson_depth)
 
@@ -354,12 +356,19 @@ def save_results(
     os.makedirs(output_dir, exist_ok=True)
     n_views = n_turntable + n_random
 
-    flow_pts = results["flow_registered_points"]
+    flow_pts = results["flow_points"]
     if flow_pts.shape[0] > 0:
         pcd = make_pcd(flow_pts, estimate_normals=True)
-        ply_path = os.path.join(output_dir, "stone_registered.ply")
+        ply_path = os.path.join(output_dir, "stone_flow.ply")
         o3d.io.write_point_cloud(ply_path, pcd)
-        LOG.info("Saved registered cloud: %s (%d pts)", ply_path, flow_pts.shape[0])
+        LOG.info("Saved flow cloud: %s (%d pts)", ply_path, flow_pts.shape[0])
+
+    upsampled = results.get("upsampled_points")
+    if upsampled is not None and upsampled.shape[0] > 0:
+        up_pcd = make_pcd(upsampled, estimate_normals=True)
+        up_path = os.path.join(output_dir, "stone_upsampled.ply")
+        o3d.io.write_point_cloud(up_path, up_pcd)
+        LOG.info("Saved upsampled cloud: %s (%d pts)", up_path, upsampled.shape[0])
 
     stone_pts = results["stone_points_input"]
     if stone_pts.shape[0] > 0:
@@ -388,6 +397,7 @@ def save_results(
         f"Total points:     {results['n_total_points']}",
         f"Stone points:     {results['n_stone_points']} ({results['seg_ratio']:.1%})",
         f"Flow points:      {results['n_flow_points']}",
+        f"Upsampled points: {results.get('n_upsampled_points', 'N/A')}",
         f"Flow ODE steps:   {results['flow_steps']}",
         "",
         "--- Mesh Reconstruction ---",
@@ -410,7 +420,8 @@ def save_results(
         f"Inference time:   {elapsed_s:.3f} s",
         "",
         "Output files:",
-        "  Registered PC:  stone_registered.ply",
+        "  Upsampled PC:   stone_upsampled.ply",
+        "  Flow PC:        stone_flow.ply",
         "  Segmented PC:   stone_segmented.ply",
     ]
     if mesh is not None:
@@ -434,6 +445,7 @@ def save_results(
         "n_stone_points": results["n_stone_points"],
         "n_total_points": results["n_total_points"],
         "n_flow_points": results["n_flow_points"],
+        "n_upsampled_points": results.get("n_upsampled_points", 0),
         "seg_ratio": results["seg_ratio"],
         "flow_steps": results["flow_steps"],
         "n_views": n_views,
@@ -453,15 +465,117 @@ def save_results(
         json.dump(result_json, f, indent=2)
 
 
+def _chamfer_distance_np(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
+    """Chamfer distance between two point clouds: (a→b, b→a, avg)."""
+    from scipy.spatial import cKDTree
+    ta, tb = cKDTree(a), cKDTree(b)
+    da, _ = tb.query(a)
+    db, _ = ta.query(b)
+    return float(da.mean()), float(db.mean()), float((da.mean() + db.mean()) / 2)
+
+
+def save_diagnostics(
+    results: Dict,
+    output_dir: str,
+    gt_cloud_path: Optional[str] = None,
+):
+    """Save comprehensive diagnostics for evaluating model quality.
+
+    Produces diagnostics.json with all the metrics needed to judge
+    whether the model is working correctly, without needing interactive
+    inspection.
+    """
+    diag: Dict = {}
+
+    flow = results["flow_points"]
+    up = results["upsampled_points"]
+
+    diag["flow_center"] = flow.mean(axis=0).tolist()
+    diag["flow_std"] = flow.std(axis=0).tolist()
+    diag["flow_span"] = (flow.max(axis=0) - flow.min(axis=0)).tolist()
+    diag["flow_n_points"] = flow.shape[0]
+
+    diag["upsampled_center"] = up.mean(axis=0).tolist()
+    diag["upsampled_std"] = up.std(axis=0).tolist()
+    diag["upsampled_span"] = (up.max(axis=0) - up.min(axis=0)).tolist()
+
+    diag["seg_ratio"] = results["seg_ratio"]
+    diag["seg_n_stone"] = results["n_stone_points"]
+    diag["seg_n_total"] = results["n_total_points"]
+
+    diag["volume_cm3"] = results.get("volume_cm3", 0.0)
+    diag["mesh_watertight"] = results.get("mesh_watertight", False)
+
+    if gt_cloud_path and os.path.isfile(gt_cloud_path):
+        if gt_cloud_path.endswith(".npy"):
+            gt = np.load(gt_cloud_path).astype(np.float32)
+        else:
+            gt_pcd = o3d.io.read_point_cloud(gt_cloud_path)
+            gt = np.asarray(gt_pcd.points, dtype=np.float32)
+
+        diag["gt_n_points"] = gt.shape[0]
+        diag["gt_center"] = gt.mean(axis=0).tolist()
+        diag["gt_std"] = gt.std(axis=0).tolist()
+        diag["gt_span"] = (gt.max(axis=0) - gt.min(axis=0)).tolist()
+
+        cd_flow = _chamfer_distance_np(flow, gt)
+        diag["chamfer_flow_to_gt"] = cd_flow[0]
+        diag["chamfer_gt_to_flow"] = cd_flow[1]
+        diag["chamfer_flow_avg"] = cd_flow[2]
+
+        cd_up = _chamfer_distance_np(up, gt)
+        diag["chamfer_up_to_gt"] = cd_up[0]
+        diag["chamfer_gt_to_up"] = cd_up[1]
+        diag["chamfer_up_avg"] = cd_up[2]
+
+        gt_span_norm = float(np.linalg.norm(gt.max(0) - gt.min(0)))
+        diag["chamfer_flow_pct"] = cd_flow[2] / gt_span_norm * 100 if gt_span_norm > 0 else 0
+        diag["chamfer_up_pct"] = cd_up[2] / gt_span_norm * 100 if gt_span_norm > 0 else 0
+
+        gt_vol_ellipsoid = (4/3) * np.pi * np.prod(gt.std(axis=0))
+        diag["gt_volume_est_cm3"] = float(gt_vol_ellipsoid)
+
+        scale_ratio = float(np.linalg.norm(flow.std(0)) / max(np.linalg.norm(gt.std(0)), 1e-9))
+        diag["scale_ratio_flow_vs_gt"] = scale_ratio
+
+        diag["PASS_chamfer_under_10pct"] = diag["chamfer_flow_pct"] < 10.0
+        diag["PASS_scale_ratio_0.8_1.2"] = 0.8 < scale_ratio < 1.2
+        diag["PASS_mesh_watertight"] = diag["mesh_watertight"]
+        diag["PASS_volume_nonzero"] = diag["volume_cm3"] > 1e-6
+
+        np.save(os.path.join(output_dir, "gt_cloud_used.npy"), gt)
+
+    path = os.path.join(output_dir, "diagnostics.json")
+    with open(path, "w") as f:
+        json.dump(diag, f, indent=2)
+    LOG.info("Saved diagnostics: %s", path)
+
+    print("\n" + "=" * 60)
+    print("  DIAGNOSTICS SUMMARY")
+    print("=" * 60)
+    for k, v in diag.items():
+        if k.startswith("PASS_"):
+            status = "PASS" if v else "FAIL"
+            print(f"  [{status}] {k[5:]}")
+    if "chamfer_flow_pct" in diag:
+        print(f"\n  Chamfer (flow→GT): {diag['chamfer_flow_pct']:.1f}% of GT span")
+        print(f"  Chamfer (up→GT):   {diag['chamfer_up_pct']:.1f}% of GT span")
+        print(f"  Scale ratio:       {diag['scale_ratio_flow_vs_gt']:.2f}x")
+    print(f"  Seg ratio:         {diag['seg_ratio']:.1%}")
+    print(f"  Volume:            {diag['volume_cm3']:.6f} cm³")
+    print("=" * 60 + "\n")
+
+    return diag
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Predict stone volume: neural segmentation + RPF flow registration + Poisson mesh"
+        description="Predict stone volume: sequential seg -> align -> flow -> Poisson mesh"
     )
     parser.add_argument("--depth_dir", required=True,
                         help="Directory with turntable .npy depth files")
     parser.add_argument("--random_depth_dir", default=None,
-                        help="Optional directory with random-view .npy depth files "
-                             "(must contain poses.json with per-view 4x4 extrinsics)")
+                        help="Optional directory with random-view .npy depth files")
     parser.add_argument("--intrinsics", required=True,
                         help="Path to intrinsics.txt")
     parser.add_argument("--sequence", required=True,
@@ -470,12 +584,16 @@ def main():
                         help="Path to trained model weights (.pt)")
     parser.add_argument("--output_dir", default="volume_output",
                         help="Output directory")
+    parser.add_argument("--gt_cloud", default=None,
+                        help="Path to GT point cloud (.ply or .npy) for diagnostics. "
+                             "When provided, computes Chamfer distance, scale ratio, "
+                             "and PASS/FAIL checks against ground truth.")
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=576)
     parser.add_argument("--max_points_per_view", type=int, default=4096)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--flow_steps", type=int, default=10,
-                        help="Number of Euler ODE steps for RPF flow registration")
+    parser.add_argument("--flow_steps", type=int, default=20,
+                        help="Number of Euler ODE steps for RPF flow generation")
     parser.add_argument("--poisson_depth", type=int, default=9,
                         help="Octree depth for Poisson surface reconstruction")
 
@@ -487,9 +605,10 @@ def main():
     model = StoneReconNet(cfg)
 
     state = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model = model.to(args.device)
     model.eval()
+    _seg_model_ref[0] = model
     LOG.info("Model loaded (%s)", args.device)
 
     K = load_intrinsics(args.intrinsics, args.sequence, args.width, args.height)
@@ -498,28 +617,20 @@ def main():
     LOG.info("Found %d turntable depth files in %s", len(depth_files), args.depth_dir)
 
     random_depth_files = None
-    random_poses = None
     if args.random_depth_dir:
         random_depth_files = _load_depth_files(args.random_depth_dir)
-        random_poses = _load_poses_for_inference(args.random_depth_dir)
         LOG.info("Found %d random-view depth files in %s",
                  len(random_depth_files), args.random_depth_dir)
-        if random_poses:
-            LOG.info("Loaded %d poses from poses.json", len(random_poses))
-        else:
-            LOG.warning("No poses.json found in %s — random views will be treated "
-                        "as unposed (model must handle registration)", args.random_depth_dir)
 
-    LOG.info("Preparing input...")
+    LOG.info("Preparing input (camera-space, no poses)...")
     batch, centroid, n_turntable, n_random = _prepare_input(
         depth_files, K,
         max_points_per_view=args.max_points_per_view,
         device=args.device,
         random_depth_files=random_depth_files,
-        random_poses=random_poses,
     )
 
-    LOG.info("Running inference (RPF flow + Poisson mesh)...")
+    LOG.info("Running inference (seg -> align -> flow -> mesh)...")
     t0 = time.perf_counter()
     results = predict(
         model, batch, centroid,
@@ -533,6 +644,8 @@ def main():
         n_turntable, n_random, elapsed,
         random_depth_dir=args.random_depth_dir,
     )
+
+    save_diagnostics(results, args.output_dir, gt_cloud_path=args.gt_cloud)
     LOG.info("Done.")
 
 
