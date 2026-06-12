@@ -84,7 +84,7 @@ class StoneReconLightning(pl.LightningModule):
         model_cfg: StoneReconNetConfig,
         loss_weights: LossWeights,
         lr: float = 1e-3,
-        weight_decay: float = 1e-4,
+        weight_decay: float = 1e-3,
         max_epochs: int = 200,
         freeze_encoder_after: int = -1,
     ):
@@ -150,6 +150,17 @@ class StoneReconLightning(pl.LightningModule):
         ):
             self.model.freeze_encoder()
 
+    def on_train_epoch_end(self) -> None:
+        metrics = {k: v.item() if hasattr(v, "item") else v
+                   for k, v in self.trainer.callback_metrics.items()}
+        parts = [f"Epoch {self.current_epoch:>4d}"]
+        for key in ["train/loss", "train/flow_loss", "train/seg_loss",
+                     "train/chamfer_loss", "train/seg_iou", "train/seg_f1",
+                     "val/loss", "val/flow_loss", "val/seg_iou"]:
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.4f}")
+        LOG.info("  ".join(parts))
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
@@ -185,6 +196,7 @@ def build_datasets(
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
     random_views_suffix: str = "_random_npy",
+    gt_cloud_dir: Optional[str] = None,
 ) -> tuple:
     train_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -197,6 +209,7 @@ def build_datasets(
         augment=True,
         samples_per_epoch=train_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
     val_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -209,6 +222,7 @@ def build_datasets(
         augment=False,
         samples_per_epoch=val_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
     return train_ds, val_ds
 
@@ -240,7 +254,7 @@ def train(
     max_epochs: int = 200,
     batch_size: int = 4,
     lr: float = 1e-3,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 1e-3,
     max_points_per_view: int = 4096,
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
@@ -250,15 +264,32 @@ def train(
     wandb_project: str = "stone-recon",
     loss_w_seg: float = 1.0,
     loss_w_flow: float = 1.0,
+    loss_w_chamfer: float = 0.5,
     patience: int = 30,
     width: int = 1024,
     height: int = 576,
     freeze_encoder_after: int = -1,
     random_views_suffix: str = "_random_npy",
+    gt_cloud_dir: Optional[str] = None,
 ):
     """Run the full training pipeline."""
     os.makedirs(output_dir, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    log_file = os.path.join(output_dir, "training.log")
+    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    LOG.info("Logging to console and %s", log_file)
 
     _enable_cuda_optimizations()
 
@@ -278,6 +309,7 @@ def train(
         train_samples_per_epoch=train_samples_per_epoch,
         val_samples_per_epoch=val_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
 
     train_loader = DataLoader(
@@ -292,7 +324,7 @@ def train(
     )
 
     model_cfg = StoneReconNetConfig()
-    loss_weights = LossWeights(seg=loss_w_seg, flow=loss_w_flow)
+    loss_weights = LossWeights(seg=loss_w_seg, flow=loss_w_flow, chamfer=loss_w_chamfer)
 
     lit_model = StoneReconLightning(
         model_cfg=model_cfg,
@@ -305,7 +337,8 @@ def train(
 
     param_counts = lit_model.model.count_parameters()
     LOG.info("Model parameters: %s", param_counts)
-    LOG.info("Loss weights -- seg: %.3f, flow: %.3f", loss_w_seg, loss_w_flow)
+    LOG.info("Loss weights -- seg: %.3f, flow: %.3f, chamfer: %.3f",
+             loss_w_seg, loss_w_flow, loss_w_chamfer)
     if freeze_encoder_after >= 0:
         LOG.info("Encoder freezes after epoch %d", freeze_encoder_after)
 
@@ -371,15 +404,26 @@ def train(
         torch.save(best.model.state_dict(), final_path)
         LOG.info("Saved final model weights: %s", final_path)
 
+    final_metrics = {k: v.item() if hasattr(v, "item") else v
+                     for k, v in trainer.callback_metrics.items()}
+    LOG.info("=" * 60)
+    LOG.info("TRAINING COMPLETE")
+    LOG.info("Best checkpoint: %s", best_ckpt)
+    for k in sorted(final_metrics):
+        LOG.info("  %-30s = %.6f", k, final_metrics[k])
+    LOG.info("=" * 60)
+
     summary = {
         "train_stones": train_stones,
         "val_stones": val_stones_final,
         "best_checkpoint": best_ckpt,
         "model_params": param_counts,
+        "final_metrics": {k: float(v) for k, v in final_metrics.items()},
         "max_epochs": max_epochs,
         "lr": lr,
         "loss_w_seg": loss_w_seg,
         "loss_w_flow": loss_w_flow,
+        "loss_w_chamfer": loss_w_chamfer,
         "freeze_encoder_after": freeze_encoder_after,
         "random_views_suffix": random_views_suffix,
     }
@@ -405,7 +449,7 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--max_points_per_view", type=int, default=4096)
     parser.add_argument("--train_samples_per_epoch", type=int, default=500)
     parser.add_argument("--val_samples_per_epoch", type=int, default=100)
@@ -420,12 +464,19 @@ def main():
                         help="Weight for segmentation BCE loss")
     parser.add_argument("--loss_w_flow", type=float, default=1.0,
                         help="Weight for RPF flow velocity MSE loss")
+    parser.add_argument("--loss_w_chamfer", type=float, default=0.5,
+                        help="Weight for Chamfer distance loss (upsampled vs GT2)")
 
     parser.add_argument("--freeze_encoder_after", type=int, default=-1,
                         help="Freeze PointNet++ encoder after this epoch (-1 = never)")
     parser.add_argument("--random_views_suffix", default="_random_npy",
                         help="Suffix for random-views directories (default: _random_npy). "
                              "Set to empty string to disable random views.")
+    parser.add_argument("--gt_cloud_dir", default=None,
+                        help="Directory with Blender-exported GT stone point clouds "
+                             "(stone_XX_gt_pointcloud.ply). When provided, the model "
+                             "learns to reconstruct the complete Blender stone shape "
+                             "instead of using turntable-merged depth as GT.")
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="stone-recon")
@@ -451,11 +502,13 @@ def main():
         wandb_project=args.wandb_project,
         loss_w_seg=args.loss_w_seg,
         loss_w_flow=args.loss_w_flow,
+        loss_w_chamfer=args.loss_w_chamfer,
         patience=args.patience,
         width=args.width,
         height=args.height,
         freeze_encoder_after=args.freeze_encoder_after,
         random_views_suffix=args.random_views_suffix,
+        gt_cloud_dir=args.gt_cloud_dir,
     )
 
 
