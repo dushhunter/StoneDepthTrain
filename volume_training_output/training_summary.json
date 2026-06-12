@@ -15,15 +15,15 @@
     "stone_11",
     "stone_12"
   ],
-  "best_checkpoint": "/home/dilan/msc_research/StoneVolMain/volume_training_output/checkpoints/best-epoch=069-val/loss=0.2803.ckpt",
+  "best_checkpoint": "/home/dilan/msc_research/StoneVolMain/volume_training_output/checkpoints/best-epoch=104-val/loss=0.2606.ckpt",
   "model_params": {
     "encoder": 280384,
     "seg_head": 41601,
-    "multi_view_attn": 5340928,
+    "multi_view_attn": 7110144,
     "flow_head": 125059,
-    "total": 5889488
+    "total": 7658704
   },
-  "max_epochs": 100,
+  "max_epochs": 150,
   "lr": 0.001,
   "loss_w_seg": 1.0,
   "loss_w_flow": 1.0,
