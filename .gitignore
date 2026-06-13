@@ -1,5 +1,3 @@
-volume_output/
-*.ply
 *.obj
 *.stl
 MscProjectLatest/
@@ -8,7 +6,6 @@ MscProjectLatest/
 *.swp
 *.swo
 .DS_Store
-*.log
 __pycache__
 .cuda-link
 exps
@@ -22,5 +19,3 @@ stone_weights
 test*
 third_party
 venv
-volume_training_output
-stone_syn_dataset

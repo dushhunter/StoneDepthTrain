@@ -1,0 +1,45 @@
+freeze_encoder_after: -1
+loss_weights: !!python/object:volume_estimation.loss.LossWeights
+  chamfer: 0.5
+  flow: 1.0
+  seg: 1.0
+lr: 0.001
+max_epochs: 20
+model_cfg: !!python/object:volume_estimation.model.StoneReconNetConfig
+  attn_dropout: 0.0
+  attn_embed_dim: 256
+  attn_max_views: 32
+  attn_n_heads: 8
+  attn_n_layers: 4
+  attn_qk_norm: true
+  feature_dim: 256
+  flow_loss_type: mse
+  inference_sampling_steps: 20
+  sa1_mlp:
+  - 64
+  - 64
+  - 128
+  sa1_npoint: 2048
+  sa1_nsample: 32
+  sa1_radius: 0.01
+  sa2_mlp:
+  - 128
+  - 128
+  - 256
+  sa2_npoint: 512
+  sa2_nsample: 32
+  sa2_radius: 0.02
+  sa3_mlp:
+  - 256
+  - 256
+  - 256
+  sa3_npoint: 512
+  sa3_nsample: 32
+  sa3_radius: 0.04
+  seg_dropout: 0.3
+  seg_hidden_dim: 128
+  t_embed_dim: 64
+  timestep_sampling: u_shaped
+  upsample_factor: 8
+  use_flow_xyz_for_pos_enc: true
+weight_decay: 0.001
