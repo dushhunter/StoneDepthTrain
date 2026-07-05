@@ -207,6 +207,47 @@ class MonodepthOptions:
                                  type=float,
                                  help="weight for surface-normal loss (angular surface matching)",
                                  default=0.0)
+        self.parser.add_argument("--stone_loss_weight",
+                                 type=float,
+                                 help=("extra weight applied to foreground (stone) pixels in the GT depth "
+                                       "loss; 1.0 = uniform (stone and flat surface weighted equally), >1 "
+                                       "up-weights the protruding stone so its few-mm relief is not drowned "
+                                       "out by the dominant flat surface. Requires --use_mask."),
+                                 default=1.0)
+        self.parser.add_argument("--boundary_loss_weight",
+                                 type=float,
+                                 help=("extra weight applied to stone silhouette/boundary pixels (a dilate-minus-"
+                                       "erode ring of the mask) in the GT depth loss, where the largest mm depth "
+                                       "errors occur. 0 disables. Requires --use_mask."),
+                                 default=0.0)
+        self.parser.add_argument("--gt_silog_weight",
+                                 type=float,
+                                 help=("weight for the scale-invariant log (silog) term added to the GT depth "
+                                       "loss. Default 0 keeps the objective absolute (best for mm accuracy); "
+                                       "set >0 to re-enable scale-invariant supervision."),
+                                 default=0.0)
+        self.parser.add_argument("--use_berhu_loss",
+                                 help=("if set, uses a (mask-weighted) BerHu / reverse-Huber loss instead of L1 "
+                                       "for the GT depth term (L1 for small errors, L2 for large ones)."),
+                                 action="store_true")
+        self.parser.add_argument("--use_photometric",
+                                 help=("if set, runs the self-supervised photometric reprojection + disparity "
+                                       "smoothness loss and the multi-view photometric consistency loss. When "
+                                       "--use_gt_depth is set these default OFF so training is fully "
+                                       "GT-supervised; set this flag to force them back on."),
+                                 action="store_true")
+        self.parser.add_argument("--decoder_norm",
+                                 type=str,
+                                 help=("normalization used in the Unet depth decoder. 'group' (GroupNorm) is "
+                                       "stable at very small batch sizes; 'batch' (BatchNorm) needs larger "
+                                       "batches for reliable statistics."),
+                                 choices=["batch", "group"],
+                                 default="group")
+        self.parser.add_argument("--use_strong_aug",
+                                 help=("if set, applies sim2real domain-randomization augmentation (gamma, blur, "
+                                       "synthetic specular highlights, noise) to the training images. Metric-safe: "
+                                       "no geometric change, so GT depth/intrinsics stay valid."),
+                                 action="store_true")
 
         # Multi-view learning enhancements
         self.parser.add_argument("--use_smoothness_loss",
