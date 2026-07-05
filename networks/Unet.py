@@ -7,6 +7,24 @@ from typing import Optional, List
 # from backbones_unet import __available_models__
 
 
+def make_decoder_norm(decoder_norm="batch", max_groups=8):
+    """Return a callable ``norm(num_channels) -> nn.Module`` for the Unet decoder.
+
+    GroupNorm is independent of batch size, which matters here because the stone
+    dataset is trained with a very small (often 1) batch size where BatchNorm
+    statistics are unstable/biased. The number of groups is reduced to a divisor
+    of the channel count so any decoder width is supported.
+    """
+    if decoder_norm == "group":
+        def _group_norm(num_channels):
+            groups = max_groups
+            while groups > 1 and (num_channels % groups != 0):
+                groups //= 2
+            return nn.GroupNorm(groups, num_channels)
+        return _group_norm
+    return nn.BatchNorm2d
+
+
 class Unet(nn.Module):
     """
     This class utilizes a pre-trained model as a backbone network and 
@@ -97,6 +115,7 @@ class Unet(nn.Module):
             num_classes=5,
             center=False,
             norm_layer=nn.BatchNorm2d,
+            decoder_norm="batch",
             activation=nn.ReLU
     ):
         super().__init__()
@@ -134,6 +153,9 @@ class Unet(nn.Module):
 
         if not decoder_use_batchnorm:
             norm_layer = None
+        elif decoder_norm == "group":
+            # GroupNorm is stable at very small batch sizes (bs=1), unlike BatchNorm.
+            norm_layer = make_decoder_norm("group")
         self.decoder = UnetDecoder(
             encoder_channels=encoder_channels,
             decoder_channels=decoder_channels,
