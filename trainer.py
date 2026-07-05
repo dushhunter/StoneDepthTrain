@@ -76,7 +76,7 @@ class Trainer:
         elif self.opt.backbone == "eff_b5":
             self.models["encoder"] = networks.BaseEncoder.build(num_features=self.opt.num_features, model_dim=self.opt.model_dim)
         else: 
-            self.models["encoder"] = networks.Unet(pretrained=(not self.opt.load_pretrained_model), backbone=self.opt.backbone, in_channels=3, num_classes=self.opt.model_dim, decoder_channels=self.opt.dec_channels)
+            self.models["encoder"] = networks.Unet(pretrained=(not self.opt.load_pretrained_model), backbone=self.opt.backbone, in_channels=3, num_classes=self.opt.model_dim, decoder_channels=self.opt.dec_channels, decoder_norm=getattr(self.opt, "decoder_norm", "group"))
 
         if self.opt.load_pretrained_model:
             print("-> Loading pretrained encoder from ", self.opt.load_pt_folder)
@@ -191,7 +191,8 @@ class Trainer:
                 gt_depth_path=self.opt.gt_depth_path if self.opt.gt_depth_path else self.opt.data_path,
                 gt_depth_subdir=self.opt.gt_depth_subdir,
                 gt_depth_encoding=self.opt.gt_depth_encoding,
-                gt_depth_scale=self.opt.gt_depth_scale)
+                gt_depth_scale=self.opt.gt_depth_scale,
+                use_strong_aug=getattr(self.opt, "use_strong_aug", False))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             train_dataset = self.dataset(
             self.opt.intrinsics_file_path, self.opt.data_path, train_filenames,  # StoneVol_main: pass intrinsics file first
@@ -306,7 +307,9 @@ class Trainer:
         try:
             self.epoch = 0
             self.step = 0
-            self.best_abs_rel = float('inf')
+            # Best model is selected on the stone-region RMSE (metres) when a
+            # foreground mask is available, else on the global scene RMSE.
+            self.best_val_metric = float('inf')
             self.best_epoch = -1
             self.start_time = time.time()
             self.save_model()
@@ -315,25 +318,28 @@ class Trainer:
                 self.model_lr_scheduler.step()
                 if (self.epoch + 1) % self.opt.save_frequency == 0:
                     self.save_model()
-                val_abs_rel = self.validate_full_epoch()
-                if val_abs_rel is not None and val_abs_rel < self.best_abs_rel:
-                    self.best_abs_rel = val_abs_rel
+                val_metric = self.validate_full_epoch()
+                if val_metric is not None and val_metric < self.best_val_metric:
+                    self.best_val_metric = val_metric
                     self.best_epoch = self.epoch
                     self.save_model_best()
                     self.mlflow.log_metrics(
-                        {"abs_rel": self.best_abs_rel, "epoch": float(self.best_epoch)},
+                        {"stone_rmse": self.best_val_metric, "stone_rmse_mm": self.best_val_metric * 1000,
+                         "epoch": float(self.best_epoch)},
                         step=self.epoch,
                         prefix="best",
                     )
-                    print("  ** Best model so far (abs_rel={:.6f}) saved at epoch {}".format(
-                        self.best_abs_rel, self.best_epoch))
+                    print("  ** Best model so far (stone_rmse={:.6f}m / {:.3f}mm) saved at epoch {}".format(
+                        self.best_val_metric, self.best_val_metric * 1000, self.best_epoch))
             print("\n=== Training complete ===")
-            print("  Best epoch: {}  (abs_rel={:.6f})".format(self.best_epoch, self.best_abs_rel))
+            print("  Best epoch: {}  (stone_rmse={:.6f}m / {:.3f}mm)".format(
+                self.best_epoch, self.best_val_metric, self.best_val_metric * 1000))
             print("  Best weights: {}/models/weights_best/".format(self.log_path))
 
             self.mlflow.log_metrics(
                 {
-                    "best_abs_rel": self.best_abs_rel,
+                    "best_stone_rmse": self.best_val_metric,
+                    "best_stone_rmse_mm": self.best_val_metric * 1000,
                     "best_epoch": float(self.best_epoch),
                 },
                 step=self.epoch,
@@ -534,14 +540,29 @@ class Trainer:
         self.set_train()
 
     def validate_full_epoch(self):
-        """Run validation over the entire val set and return abs_rel.
+        """Run validation over the entire val set.
 
+        Returns the selection metric (lower = better): the stone-region RMSE in
+        metres when a foreground mask is available, otherwise the global RMSE.
         Returns None if GT depth is not available.
+
+        Pixel-count-weighted accumulators are used (rather than averaging
+        per-batch means) so the reported numbers are exact over the val set.
+        Because the dominant flat surface drowns out the few-mm gem relief in a
+        global metric, the stone-region RMSE (in mm) and mm-threshold accuracies
+        are the metrics that actually reflect accuracy on the gemstone.
         """
         self.set_eval()
-        abs_rel_sum = 0.0
-        rmse_sum = 0.0
-        count = 0
+        # Global accumulators (whole valid scene).
+        g_abs_rel_sum = 0.0
+        g_se_sum = 0.0
+        g_n = 0.0
+        # Stone-region accumulators (foreground mask only).
+        s_abs_rel_sum = 0.0
+        s_se_sum = 0.0
+        s_n = 0.0
+        s_within = {1.0: 0.0, 2.0: 0.0, 5.0: 0.0}  # mm thresholds
+        have_mask = False
 
         with torch.no_grad():
             for inputs in self.val_loader:
@@ -573,37 +594,79 @@ class Trainer:
                 if valid.sum() == 0:
                     continue
 
-                gt_valid = depth_gt[valid]
-                pred_valid = depth_pred[valid]
+                gt_v = depth_gt[valid]
+                pred_v = depth_pred[valid]
+                err_v = pred_v - gt_v
+                g_abs_rel_sum += (torch.abs(err_v) / gt_v).sum().item()
+                g_se_sum += (err_v ** 2).sum().item()
+                g_n += float(valid.sum().item())
 
-                abs_rel_sum += (torch.abs(gt_valid - pred_valid) / gt_valid).mean().item()
-                rmse_sum += torch.sqrt(((gt_valid - pred_valid) ** 2).mean()).item()
-                count += 1
+                # Stone-region metrics restricted to the foreground mask.
+                if ("mask", 0, 0) in inputs:
+                    have_mask = True
+                    fg = inputs[("mask", 0, 0)]
+                    if fg.shape[-2:] != depth_gt.shape[-2:]:
+                        fg = F.interpolate(fg, depth_gt.shape[-2:], mode="nearest")
+                    stone_valid = valid & (fg > 0.5)
+                    if stone_valid.sum() > 0:
+                        gt_s = depth_gt[stone_valid]
+                        pred_s = depth_pred[stone_valid]
+                        err_s = pred_s - gt_s
+                        abs_err_mm = torch.abs(err_s) * 1000.0
+                        s_abs_rel_sum += (torch.abs(err_s) / gt_s).sum().item()
+                        s_se_sum += (err_s ** 2).sum().item()
+                        s_n += float(stone_valid.sum().item())
+                        for thr in s_within:
+                            s_within[thr] += float((abs_err_mm < thr).sum().item())
 
         self.set_train()
 
-        if count == 0:
+        if g_n == 0:
             return None
 
-        avg_abs_rel = abs_rel_sum / count
-        avg_rmse = rmse_sum / count
-        print("  Epoch {} full val: abs_rel={:.6f}  rmse={:.6f}m ({:.4f}mm)".format(
-            self.epoch, avg_abs_rel, avg_rmse, avg_rmse * 1000))
+        g_abs_rel = g_abs_rel_sum / g_n
+        g_rmse = (g_se_sum / g_n) ** 0.5
+        print("  Epoch {} full val (scene): abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)".format(
+            self.epoch, g_abs_rel, g_rmse, g_rmse * 1000))
 
-        self.writers["val"].add_scalar("epoch/abs_rel", avg_abs_rel, self.epoch)
-        self.writers["val"].add_scalar("epoch/rmse", avg_rmse, self.epoch)
-        self.writers["val"].add_scalar("epoch/rmse_mm", avg_rmse * 1000, self.epoch)
-        self.mlflow.log_metrics(
-            {
-                "abs_rel": avg_abs_rel,
-                "rmse": avg_rmse,
-                "rmse_mm": avg_rmse * 1000,
-            },
-            step=self.epoch,
-            prefix="val_epoch",
-        )
+        self.writers["val"].add_scalar("epoch/abs_rel", g_abs_rel, self.epoch)
+        self.writers["val"].add_scalar("epoch/rmse", g_rmse, self.epoch)
+        self.writers["val"].add_scalar("epoch/rmse_mm", g_rmse * 1000, self.epoch)
+        mlflow_metrics = {
+            "abs_rel": g_abs_rel,
+            "rmse": g_rmse,
+            "rmse_mm": g_rmse * 1000,
+        }
 
-        return avg_abs_rel
+        selection_metric = g_rmse  # fall back to scene RMSE if no mask
+
+        if have_mask and s_n > 0:
+            s_abs_rel = s_abs_rel_sum / s_n
+            s_rmse = (s_se_sum / s_n) ** 0.5
+            d1 = s_within[1.0] / s_n
+            d2 = s_within[2.0] / s_n
+            d5 = s_within[5.0] / s_n
+            print("    stone-region: abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)  "
+                  "<1mm={:.3f} <2mm={:.3f} <5mm={:.3f}".format(
+                      s_abs_rel, s_rmse, s_rmse * 1000, d1, d2, d5))
+            self.writers["val"].add_scalar("epoch/stone_rmse_mm", s_rmse * 1000, self.epoch)
+            self.writers["val"].add_scalar("epoch/stone_abs_rel", s_abs_rel, self.epoch)
+            self.writers["val"].add_scalar("epoch/stone_within_1mm", d1, self.epoch)
+            self.writers["val"].add_scalar("epoch/stone_within_2mm", d2, self.epoch)
+            self.writers["val"].add_scalar("epoch/stone_within_5mm", d5, self.epoch)
+            mlflow_metrics.update({
+                "stone_rmse": s_rmse,
+                "stone_rmse_mm": s_rmse * 1000,
+                "stone_abs_rel": s_abs_rel,
+                "stone_within_1mm": d1,
+                "stone_within_2mm": d2,
+                "stone_within_5mm": d5,
+            })
+            selection_metric = s_rmse  # select best model on stone-region RMSE
+
+        self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
+
+        return selection_metric
 
     @staticmethod
     def _to_scalar(value):
@@ -642,7 +705,8 @@ class Trainer:
             torch.save(to_save, save_path)
 
         with open(os.path.join(save_folder, "best_epoch.txt"), "w") as f:
-            f.write("epoch: {}\nabs_rel: {:.6f}\n".format(self.best_epoch, self.best_abs_rel))
+            f.write("epoch: {}\nstone_rmse_m: {:.6f}\nstone_rmse_mm: {:.3f}\n".format(
+                self.best_epoch, self.best_val_metric, self.best_val_metric * 1000))
 
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
@@ -801,7 +865,15 @@ class Trainer:
         losses = {}
         total_loss = 0
 
-        for scale in self.opt.scales:
+        # Self-supervised photometric reprojection + disparity smoothness loss.
+        # When training with GT depth this is disabled by default so the model is
+        # fully GT-supervised (the photometric term assumes Lambertian surfaces and
+        # fights the absolute metric scale / specular gem highlights). Pass
+        # --use_photometric to force it back on.
+        use_photometric = getattr(self.opt, "use_photometric", False) or \
+            not getattr(self.opt, "use_gt_depth", False)
+
+        for scale in (self.opt.scales if use_photometric else []):
             loss = 0
             reprojection_losses = []
 
@@ -909,14 +981,53 @@ class Trainer:
                 depth_pred_gt = depth_pred
             valid = (depth_gt > self.opt.min_depth) & (depth_gt < self.opt.max_depth)
             if valid.sum() > 0:
-                gt_l1 = F.l1_loss(depth_pred_gt[valid], depth_gt[valid])
+                # Per-pixel weight map that focuses supervision on the stone.
+                # The flat surface dominates the image, so without weighting the
+                # gem's few-mm relief contributes almost nothing to the loss.
+                #   weight = 1 + (stone_w - 1) * mask   (up-weight the stone body)
+                #          + boundary_w * silhouette_ring (up-weight the gem edge)
+                weight = torch.ones_like(depth_gt)
+                fg = None
+                if getattr(self.opt, "use_mask", False) and (("mask", 0, 0) in inputs):
+                    fg = inputs[("mask", 0, 0)].float()
+                    if fg.shape[-2:] != depth_gt.shape[-2:]:
+                        fg = F.interpolate(fg, depth_gt.shape[-2:], mode="nearest")
+                    stone_w = getattr(self.opt, "stone_loss_weight", 1.0)
+                    if stone_w != 1.0:
+                        weight = weight + (stone_w - 1.0) * fg
+                    boundary_w = getattr(self.opt, "boundary_loss_weight", 0.0)
+                    if boundary_w > 0:
+                        # Silhouette ring = dilate(mask) - erode(mask). Erosion is a
+                        # min-pool, implemented as -maxpool(-mask).
+                        dil = F.max_pool2d(fg, kernel_size=3, stride=1, padding=1)
+                        ero = -F.max_pool2d(-fg, kernel_size=3, stride=1, padding=1)
+                        ring = (dil - ero).clamp(0.0, 1.0)
+                        weight = weight + boundary_w * ring
+
+                # Restrict weights to valid pixels and form a weighted mean.
+                w_valid = weight * valid.float()
+                denom = w_valid.sum().clamp(min=1.0)
+                abs_diff = torch.abs(depth_pred_gt - depth_gt)
+
+                if getattr(self.opt, "use_berhu_loss", False):
+                    # BerHu (reverse Huber): L1 for small errors, L2 for large ones.
+                    c = 0.2 * abs_diff[valid].max().clamp(min=1e-7)
+                    berhu = torch.where(abs_diff <= c, abs_diff,
+                                        (abs_diff ** 2 + c ** 2) / (2.0 * c))
+                    gt_primary = (w_valid * berhu).sum() / denom
+                    losses["loss/gt_berhu"] = gt_primary
+                else:
+                    gt_primary = (w_valid * abs_diff).sum() / denom
+                    losses["loss/gt_l1"] = gt_primary
+
+                # Scale-invariant log term. Default weight is 0 so the objective is
+                # absolute (mm-accurate); enable via --gt_silog_weight if desired.
+                log_diff = torch.log(depth_pred_gt[valid]) - torch.log(depth_gt[valid])
                 gt_log = torch.sqrt(
-                    torch.var(torch.log(depth_pred_gt[valid]) - torch.log(depth_gt[valid]))
-                    + 0.15 * torch.pow(torch.mean(torch.log(depth_pred_gt[valid]) - torch.log(depth_gt[valid])), 2)
-                )
-                gt_loss = gt_l1 + 0.5 * gt_log
+                    torch.var(log_diff) + 0.15 * torch.pow(torch.mean(log_diff), 2))
+                silog_w = getattr(self.opt, "gt_silog_weight", 0.0)
+                gt_loss = gt_primary + silog_w * gt_log
                 losses["loss/gt_depth"] = gt_loss
-                losses["loss/gt_l1"] = gt_l1
                 losses["loss/gt_silog"] = gt_log
                 total_loss += self.opt.gt_depth_weight * gt_loss
 
@@ -972,8 +1083,9 @@ class Trainer:
             total_loss += smooth_weight * smoothness
 
         # ENHANCEMENT #1: Multi-view consistency loss (photometric)
-        # For turntable data, enforces geometric consistency across views
-        if getattr(self.opt, 'use_multiview_loss', False):
+        # For turntable data, enforces geometric consistency across views.
+        # Photometric, so disabled when training fully GT-supervised.
+        if use_photometric and getattr(self.opt, 'use_multiview_loss', False):
             consistency = self.compute_multiview_consistency_loss(inputs, outputs)
             if consistency > 0:
                 losses["loss/consistency"] = consistency
