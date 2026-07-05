@@ -17,6 +17,7 @@ import numpy as np  # intrinsics matrix creation + pseudo-inverse
 from PIL import Image  # PIL image ops (flip, interpolation enum)
 
 import torch  # tensors returned to the training loop
+import torch.nn.functional as F  # used by sim2real domain-randomization augmentation
 from torchvision import transforms  # ToTensor + Resize transforms
 
 from .mono_dataset_mc import MonoDatasetMultiCam, pil_loader  # base dataset + consistent image loader
@@ -47,7 +48,8 @@ class StoneDataset(MonoDatasetMultiCam):
     def __init__(self, *args, img_prefix="image", mask_prefix="mask", mask_ext=".png",
                  use_mask=False, use_gt_depth=False, gt_depth_path=None,
                  gt_depth_subdir="data_depth_annotated/train/groundtruth",
-                 gt_depth_encoding="auto", gt_depth_scale=100000.0, **kwargs):
+                 gt_depth_encoding="auto", gt_depth_scale=100000.0,
+                 use_strong_aug=False, **kwargs):
         # `*args` / `**kwargs` are forwarded to the base class. For StoneDataset, the
         # base constructor comes from MonoDatasetMultiCam and typically includes:
         #   (intrinsics_file_path, data_path, filenames, height, width, frame_idxs, num_scales, ...)
@@ -62,6 +64,7 @@ class StoneDataset(MonoDatasetMultiCam):
         self.gt_depth_subdir = gt_depth_subdir  # relative GT root, supports custom folders
         self.gt_depth_encoding = gt_depth_encoding  # auto | uint16 | float32_rgba
         self.gt_depth_scale = float(gt_depth_scale)  # uint16 PNG → metres divisor (default 100000)
+        self.use_strong_aug = use_strong_aug  # sim2real domain-randomization augmentation
         self.interp_mask = Image.NEAREST  # keep masks discrete (no interpolation blending)
         self.mask_resize = {}  # per-scale resize transforms for masks
 
@@ -70,6 +73,50 @@ class StoneDataset(MonoDatasetMultiCam):
             self.mask_resize[i] = transforms.Resize(  # torch/torchvision transform object
                 (self.height // s, self.width // s), interpolation=self.interp_mask  # (H,W) at this scale
             )
+
+    def _gaussian_blur(self, t, ksize=5, sigma=1.0):
+        """Apply a separable Gaussian blur to a [3, H, W] tensor in [0, 1]."""
+        coords = torch.arange(ksize, dtype=torch.float32) - (ksize - 1) / 2.0
+        g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+        g = g / g.sum()
+        kernel2d = torch.outer(g, g)
+        kernel = kernel2d.view(1, 1, ksize, ksize).repeat(t.shape[0], 1, 1, 1)
+        out = F.conv2d(t.unsqueeze(0), kernel, padding=ksize // 2, groups=t.shape[0])
+        return out.squeeze(0)
+
+    def _add_specular(self, t):
+        """Add 1-3 soft bright blobs to simulate specular highlights on a shiny gem."""
+        c, h, w = t.shape
+        yy = torch.arange(h, dtype=torch.float32).view(h, 1)
+        xx = torch.arange(w, dtype=torch.float32).view(1, w)
+        highlight = torch.zeros(h, w)
+        for _ in range(random.randint(1, 3)):
+            cy = random.uniform(0, h)
+            cx = random.uniform(0, w)
+            radius = random.uniform(0.02, 0.08) * max(h, w)
+            amp = random.uniform(0.3, 0.8)
+            blob = amp * torch.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * radius ** 2)))
+            highlight = torch.maximum(highlight, blob)
+        return (t + highlight.unsqueeze(0)).clamp(0.0, 1.0)
+
+    def _domain_randomize(self, t):
+        """Photometric (metric-safe) sim2real augmentation for a [3, H, W] tensor.
+
+        Applies random gamma, Gaussian blur and synthetic specular highlights, each
+        with its own probability. None of these change geometry, so the GT depth map
+        and camera intrinsics remain valid.
+        """
+        # Random gamma (lighting/exposure variation).
+        if random.random() < 0.5:
+            gamma = random.uniform(0.7, 1.4)
+            t = t.clamp(min=1e-4) ** gamma
+        # Random Gaussian blur (defocus / sensor differences).
+        if random.random() < 0.3:
+            t = self._gaussian_blur(t, ksize=5, sigma=random.uniform(0.5, 1.5))
+        # Synthetic specular highlights (shiny/translucent gem material).
+        if random.random() < 0.4:
+            t = self._add_specular(t)
+        return t.clamp(0.0, 1.0)
 
     def preprocess(self, inputs, color_aug):
         """Convert PIL images to tensors and build image/mask pyramids.
@@ -113,6 +160,11 @@ class StoneDataset(MonoDatasetMultiCam):
                 inputs[(n, im, i)] = self.to_tensor(f)  # RGB -> float tensor in [0,1]
                 aug_tensor = self.to_tensor(color_aug(f))  # augmented view used for training
                 if self.is_train:  # only keep augmented view during training to save memory
+                    # Optional sim2real domain randomization (gamma / blur / specular).
+                    # Metric-safe: only photometric, no geometric change, so GT depth
+                    # and intrinsics stay valid.
+                    if self.use_strong_aug:
+                        aug_tensor = self._domain_randomize(aug_tensor)
                     noise = torch.randn_like(aug_tensor) * 0.02  # small random noise for augmentation
                     aug_tensor = torch.clamp(aug_tensor + noise, 0.0, 1.0)  # add noise and clamp to [0,1]
                 inputs[(n + "_aug", im, i)] = aug_tensor  # store augmented tensor
