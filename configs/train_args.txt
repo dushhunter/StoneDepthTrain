@@ -5,34 +5,38 @@
 --height 576
 --width 1024
 --batch_size 1
+--accumulation_steps 8
 --num_epochs 30
 --frame_ids 0 -1 1
---min_depth 0.3
---max_depth 0.8
+--min_depth 0.40
+--max_depth 0.65
 --learning_rate 1e-4
 --model_dim 32
 --query_nums 64
 --patch_size 16
---dim_out 512
+--dim_out 1024
+--decoder_norm group
 --log_dir stone_weights
---model_name my_stone_experiment_32bit_L1_mask_2
+--model_name my_stone_experiment_mm_v2
 --use_known_pose
 --turntable_angle_deg 3.0
 --use_gt_depth
 --gt_depth_path /home/dilan/msc_research/StoneVolMain/stone_syn_dataset
 --gt_depth_subdir data_depth_annotated/train/groundtruth_float32png
 --gt_depth_encoding float32_rgba
---gt_depth_weight 10
---disable_automasking
---use_multiview_loss
---consistency_weight 0.1
---use_smoothness_loss
---smoothness_weight 0.001
---accumulation_steps 4
---gt_grad_weight 0.7
---gt_normal_weight 0.3
+--gt_depth_weight 1.0
+--use_berhu_loss
+--gt_silog_weight 0.0
+--gt_grad_weight 0.5
+--gt_normal_weight 0.2
 --use_mask
+--stone_loss_weight 5.0
+--boundary_loss_weight 2.0
+--disable_automasking
+--use_smoothness_loss
+--smoothness_weight 0.0005
+--use_strong_aug
 --mlflow
 --mlflow_tracking_uri file:./mlruns
---mlflow_experiment_name StoneVolMain-train-with-mask
+--mlflow_experiment_name StoneVolMain-train-mm
 --mlflow_tags pipeline=train,dataset=stone
