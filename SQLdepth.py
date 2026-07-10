@@ -4,21 +4,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import hub
 import argparse
+import json
 import os
 import networks
+
+# Architecture / decoder params that MUST be identical between training and
+# inference. If they differ, the checkpoint either fails to load or produces
+# silently-wrong depth (e.g. min_depth/max_depth are NOT stored in the weights;
+# they are runtime constants baked into the decoder's bin edges).
+_SYNC_KEYS = (
+    "min_depth", "max_depth", "dim_out", "query_nums", "patch_size",
+    "model_dim", "dec_channels", "decoder_norm", "backbone", "model_type",
+    "height", "width", "num_features", "num_layers",
+)
+
 
 class SQLdepth(nn.Module):
     def __init__(self, opt):
         super(SQLdepth, self).__init__()
         self.opt = opt
+        # Reconcile architecture params with the training run before building the
+        # network, so inference always matches how the checkpoint was trained.
+        self._sync_from_training_opt()
+        decoder_norm = getattr(opt, "decoder_norm", "batch")
         if opt.model_type == "cvnxt_L":
-            self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone='convnext_large', in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels)
+            self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone='convnext_large', in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels, decoder_norm=decoder_norm)
         elif opt.backbone in ["resnet", "resnet_lite"]:
             self.encoder = networks.ResnetEncoderDecoder(num_layers=self.opt.num_layers, num_features=self.opt.num_features, model_dim=self.opt.model_dim)
         elif opt.model_type in ["nyu_pth_model", "eff_b5"]:
             self.encoder = BaseEncoder.build(num_features=opt.num_features, model_dim=opt.model_dim)
         else:
-            self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone=opt.backbone, in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels)
+            self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone=opt.backbone, in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels, decoder_norm=decoder_norm)
 
         if self.opt.backbone.endswith("_lite"):
             self.depth_decoder = networks.Lite_Depth_Decoder_QueryTr(in_channels=self.opt.model_dim, patch_size=self.opt.patch_size, dim_out=self.opt.dim_out, embedding_dim=self.opt.model_dim, 
@@ -29,6 +45,56 @@ class SQLdepth(nn.Module):
 
         if self.opt.load_pretrained_model:
             self.load_pretrained_model()
+
+    def _find_training_opt_json(self):
+        """Locate the opt.json saved by the trainer next to the checkpoint.
+
+        Weights live at {log_dir}/{model_name}/models/weights_N/ and the trainer
+        writes opt.json to {log_dir}/{model_name}/models/opt.json, so we search the
+        checkpoint folder and a few ancestors.
+        """
+        folder = getattr(self.opt, "load_pt_folder", None)
+        if not folder:
+            return None
+        folder = os.path.abspath(folder)
+        for _ in range(4):
+            candidate = os.path.join(folder, "opt.json")
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                break
+            folder = parent
+        return None
+
+    def _sync_from_training_opt(self):
+        """Override architecture params from the training opt.json if available.
+
+        This prevents silent train/inference mismatches. In particular min_depth
+        and max_depth are runtime constants (not stored in the weights) that
+        directly scale the predicted metric depth, so they MUST match training.
+        """
+        opt_path = self._find_training_opt_json()
+        if opt_path is None:
+            print("-> [warn] No training opt.json found near the checkpoint; "
+                  "using args as-is. Ensure inference args match training exactly.")
+            return
+        try:
+            with open(opt_path, "r") as f:
+                train_opt = json.load(f)
+        except Exception as exc:
+            print("-> [warn] Could not read {}: {}".format(opt_path, exc))
+            return
+
+        print("-> Syncing architecture params from training opt.json:", opt_path)
+        for key in _SYNC_KEYS:
+            if key not in train_opt:
+                continue
+            train_val = train_opt[key]
+            cur_val = getattr(self.opt, key, None)
+            if cur_val != train_val:
+                print("   - {}: {} -> {} (from training)".format(key, cur_val, train_val))
+                setattr(self.opt, key, train_val)
 
     def load_pretrained_model(self):
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
@@ -513,6 +579,11 @@ class MonodepthOptions:
                                  type=int,
                                  help="decoder channels in Unet",
                                  default=[1536, 768, 384, 192, 96])
+        self.parser.add_argument("--decoder_norm",
+                                 type=str,
+                                 help="normalization in the Unet decoder; MUST match training",
+                                 default="batch",
+                                 choices=["batch", "group"])
         self.parser.add_argument('--image_path', type=str,
                                 help='path to a test image or folder of images')
         self.parser.add_argument('--ext', type=str,
@@ -528,6 +599,3 @@ def convert_arg_line_to_args(arg_line):
         if not arg.strip():
             continue
         yield str(arg)
-
-
-
