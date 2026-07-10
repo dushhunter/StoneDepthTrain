@@ -248,6 +248,19 @@ class MonodepthOptions:
                                        "synthetic specular highlights, noise) to the training images. Metric-safe: "
                                        "no geometric change, so GT depth/intrinsics stay valid."),
                                  action="store_true")
+        self.parser.add_argument("--use_bg_randomize",
+                                 help=("if set, randomizes the appearance (color/gradient/texture/brightness) of the "
+                                       "non-stone background pixels of the target frame during training, using the "
+                                       "foreground mask. Geometry-preserving (GT depth/intrinsics stay valid): it forces "
+                                       "the network to infer floor depth from geometry instead of memorizing floor "
+                                       "texture, fixing failures on unfamiliar floors. Requires --use_mask."),
+                                 action="store_true")
+        self.parser.add_argument("--bg_randomize_prob",
+                                 type=float,
+                                 help=("probability of replacing the background appearance on a given training sample "
+                                       "when --use_bg_randomize is set (0..1). The rest keep the original floor so the "
+                                       "model still sees real backgrounds."),
+                                 default=0.5)
 
         # Multi-view learning enhancements
         self.parser.add_argument("--use_smoothness_loss",
