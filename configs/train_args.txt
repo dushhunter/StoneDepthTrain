@@ -36,6 +36,8 @@
 --use_smoothness_loss
 --smoothness_weight 0.0005
 --use_strong_aug
+--use_bg_randomize
+--bg_randomize_prob 0.5
 --mlflow
 --mlflow_tracking_uri file:./mlruns
 --mlflow_experiment_name StoneVolMain-train-mm
