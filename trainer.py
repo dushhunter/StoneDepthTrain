@@ -1032,20 +1032,32 @@ class Trainer:
                 total_loss += self.opt.gt_depth_weight * gt_loss
 
                 # Depth-gradient loss: force the model to match surface slopes,
-                # not just absolute depth values. This captures curvature/detail.
+                # not just absolute depth values. This captures curvature/detail and,
+                # crucially, the sharp depth cliff at the stone silhouette.
+                #
+                # The loss is weighted by the same per-pixel `weight` map used above
+                # (1 + stone emphasis + boundary-ring emphasis). Because the depth
+                # decoder predicts an expectation over bins, it tends to round off the
+                # silhouette; heavily up-weighting the gradient error on the boundary
+                # ring pushes the model to reproduce the steep edge instead of blurring
+                # it. Uses a weighted mean so the emphasis is a true reweighting.
                 grad_weight = getattr(self.opt, 'gt_grad_weight', 0.0)
                 if grad_weight > 0:
                     pred_dx = depth_pred_gt[:, :, :, 1:] - depth_pred_gt[:, :, :, :-1]
                     pred_dy = depth_pred_gt[:, :, 1:, :] - depth_pred_gt[:, :, :-1, :]
                     gt_dx = depth_gt[:, :, :, 1:] - depth_gt[:, :, :, :-1]
                     gt_dy = depth_gt[:, :, 1:, :] - depth_gt[:, :, :-1, :]
-                    valid_dx = valid[:, :, :, 1:] & valid[:, :, :, :-1]
-                    valid_dy = valid[:, :, 1:, :] & valid[:, :, :-1, :]
+                    valid_dx = (valid[:, :, :, 1:] & valid[:, :, :, :-1]).float()
+                    valid_dy = (valid[:, :, 1:, :] & valid[:, :, :-1, :]).float()
+                    # Edge-position weight = max of the two neighbouring pixel weights,
+                    # so a difference straddling the silhouette gets the boundary boost.
+                    w_dx = torch.maximum(weight[:, :, :, 1:], weight[:, :, :, :-1]) * valid_dx
+                    w_dy = torch.maximum(weight[:, :, 1:, :], weight[:, :, :-1, :]) * valid_dy
                     grad_loss = torch.tensor(0.0, device=self.device)
-                    if valid_dx.sum() > 0:
-                        grad_loss = grad_loss + F.l1_loss(pred_dx[valid_dx], gt_dx[valid_dx])
-                    if valid_dy.sum() > 0:
-                        grad_loss = grad_loss + F.l1_loss(pred_dy[valid_dy], gt_dy[valid_dy])
+                    if w_dx.sum() > 0:
+                        grad_loss = grad_loss + (w_dx * torch.abs(pred_dx - gt_dx)).sum() / w_dx.sum().clamp(min=1.0)
+                    if w_dy.sum() > 0:
+                        grad_loss = grad_loss + (w_dy * torch.abs(pred_dy - gt_dy)).sum() / w_dy.sum().clamp(min=1.0)
                     losses["loss/gt_grad"] = grad_loss
                     total_loss += grad_weight * grad_loss
 
