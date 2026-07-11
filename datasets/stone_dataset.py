@@ -49,8 +49,7 @@ class StoneDataset(MonoDatasetMultiCam):
                  use_mask=False, use_gt_depth=False, gt_depth_path=None,
                  gt_depth_subdir="data_depth_annotated/train/groundtruth",
                  gt_depth_encoding="auto", gt_depth_scale=100000.0,
-                 use_strong_aug=False, use_bg_randomize=False, bg_randomize_prob=0.5,
-                 **kwargs):
+                 use_strong_aug=False, **kwargs):
         # `*args` / `**kwargs` are forwarded to the base class. For StoneDataset, the
         # base constructor comes from MonoDatasetMultiCam and typically includes:
         #   (intrinsics_file_path, data_path, filenames, height, width, frame_idxs, num_scales, ...)
@@ -66,8 +65,6 @@ class StoneDataset(MonoDatasetMultiCam):
         self.gt_depth_encoding = gt_depth_encoding  # auto | uint16 | float32_rgba
         self.gt_depth_scale = float(gt_depth_scale)  # uint16 PNG → metres divisor (default 100000)
         self.use_strong_aug = use_strong_aug  # sim2real domain-randomization augmentation
-        self.use_bg_randomize = use_bg_randomize  # randomize floor/background appearance (needs mask)
-        self.bg_randomize_prob = float(bg_randomize_prob)  # per-sample probability of bg replacement
         self.interp_mask = Image.NEAREST  # keep masks discrete (no interpolation blending)
         self.mask_resize = {}  # per-scale resize transforms for masks
 
@@ -101,51 +98,6 @@ class StoneDataset(MonoDatasetMultiCam):
             blob = amp * torch.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * radius ** 2)))
             highlight = torch.maximum(highlight, blob)
         return (t + highlight.unsqueeze(0)).clamp(0.0, 1.0)
-
-    def _random_background(self, h, w):
-        """Generate a random floor/background image of shape [3, H, W] in [0, 1].
-
-        Mixes a random solid base colour with an optional smooth linear gradient
-        (simulated lighting falloff), an optional low-frequency blobby texture and
-        light noise. The point is *appearance* diversity only; it never touches
-        geometry, so the GT depth of the floor stays exactly valid.
-        """
-        base = torch.rand(3, 1, 1)  # random solid colour
-        bg = base.expand(3, h, w).clone()
-
-        # Smooth linear gradient (random direction/strength) -> lighting variation.
-        if random.random() < 0.7:
-            gy = torch.linspace(0.0, 1.0, h).view(h, 1)
-            gx = torch.linspace(0.0, 1.0, w).view(1, w)
-            a, b = random.uniform(-1.0, 1.0), random.uniform(-1.0, 1.0)
-            grad = a * gy + b * gx
-            grad = (grad - grad.min()) / (grad.max() - grad.min() + 1e-6)
-            grad = grad.unsqueeze(0)  # [1, H, W]
-            color2 = torch.rand(3, 1, 1)
-            strength = random.uniform(0.1, 0.6)
-            bg = (1.0 - strength) * bg + strength * (grad * color2 + (1.0 - grad) * base)
-
-        # Low-frequency blobby texture (upsampled random grid) -> pattern variation.
-        if random.random() < 0.6:
-            sh, sw = max(2, h // 32), max(2, w // 32)
-            small = torch.rand(1, 3, sh, sw)
-            tex = F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
-            t = random.uniform(0.2, 0.7)
-            bg = (1.0 - t) * bg + t * tex
-
-        bg = bg + torch.randn(3, h, w) * random.uniform(0.0, 0.05)  # sensor-like noise
-        return bg.clamp(0.0, 1.0)
-
-    def _randomize_background(self, color, mask):
-        """Composite the stone (foreground) over a random background.
-
-        ``color``: [3, H, W] in [0, 1]; ``mask``: [1, H, W] in {0, 1} (1 = stone).
-        Returns a new [3, H, W] tensor where only the background pixels changed.
-        """
-        _, h, w = color.shape
-        bg = self._random_background(h, w)
-        m = mask  # [1, H, W]; broadcasts over the 3 colour channels
-        return (m * color + (1.0 - m) * bg).clamp(0.0, 1.0)
 
     def _domain_randomize(self, t):
         """Photometric (metric-safe) sim2real augmentation for a [3, H, W] tensor.
@@ -222,21 +174,6 @@ class StoneDataset(MonoDatasetMultiCam):
                 if i >= 0:  # only keep pyramid scales; do not tensorize the raw (-1) entry
                     mask_tensor = transforms.ToTensor()(f)  # grayscale PIL -> 1xHxW float tensor
                     inputs[(n, im, i)] = (mask_tensor > 0.5).float()  # binarize mask for stable losses
-
-        # Geometry-preserving floor/background appearance randomization (train only).
-        # Applied to the augmented target frame the depth encoder consumes
-        # (("color_aug", 0, scale)) using the stone mask. Only the appearance of the
-        # non-stone pixels changes, so the GT depth map and intrinsics stay valid.
-        # This forces the network to learn floor geometry rather than memorize floor
-        # texture, which is what causes failures on unfamiliar floors at inference.
-        if (self.is_train and self.use_bg_randomize and self.use_mask
-                and random.random() < self.bg_randomize_prob):
-            for scale in range(self.num_scales):
-                color_key = ("color_aug", 0, scale)
-                mask_key = ("mask", 0, scale)
-                if color_key in inputs and mask_key in inputs:
-                    inputs[color_key] = self._randomize_background(
-                        inputs[color_key], inputs[mask_key])
 
     def __getitem__(self, index):
         """Return one training sample (a dict of tensors).
