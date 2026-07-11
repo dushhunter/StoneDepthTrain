@@ -14,7 +14,7 @@
 --model_dim 32
 --query_nums 64
 --patch_size 16
---dim_out 1024
+--dim_out 2048
 --decoder_norm group
 --log_dir stone_weights
 --model_name my_stone_experiment_mm_v2
@@ -27,11 +27,11 @@
 --gt_depth_weight 1.0
 --use_berhu_loss
 --gt_silog_weight 0.0
---gt_grad_weight 0.5
+--gt_grad_weight 1.5
 --gt_normal_weight 0.2
 --use_mask
 --stone_loss_weight 5.0
---boundary_loss_weight 2.0
+--boundary_loss_weight 3.0
 --disable_automasking
 --use_smoothness_loss
 --smoothness_weight 0.0005
