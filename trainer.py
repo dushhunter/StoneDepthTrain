@@ -192,9 +192,7 @@ class Trainer:
                 gt_depth_subdir=self.opt.gt_depth_subdir,
                 gt_depth_encoding=self.opt.gt_depth_encoding,
                 gt_depth_scale=self.opt.gt_depth_scale,
-                use_strong_aug=getattr(self.opt, "use_strong_aug", False),
-                use_bg_randomize=getattr(self.opt, "use_bg_randomize", False),
-                bg_randomize_prob=getattr(self.opt, "bg_randomize_prob", 0.5))
+                use_strong_aug=getattr(self.opt, "use_strong_aug", False))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             train_dataset = self.dataset(
             self.opt.intrinsics_file_path, self.opt.data_path, train_filenames,  # StoneVol_main: pass intrinsics file first
