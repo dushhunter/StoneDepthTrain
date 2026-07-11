@@ -8,8 +8,8 @@
 --accumulation_steps 8
 --num_epochs 30
 --frame_ids 0 -1 1
---min_depth 0.40
---max_depth 0.65
+--min_depth 0.30
+--max_depth 1.00
 --learning_rate 1e-4
 --model_dim 32
 --query_nums 64
@@ -36,8 +36,6 @@
 --use_smoothness_loss
 --smoothness_weight 0.0005
 --use_strong_aug
---use_bg_randomize
---bg_randomize_prob 0.5
 --mlflow
 --mlflow_tracking_uri file:./mlruns
 --mlflow_experiment_name StoneVolMain-train-mm
