@@ -16,6 +16,9 @@
 --patch_size 16
 --dim_out 2048
 --decoder_norm group
+--prob_temperature 0.5
+--use_edge_refine
+--edge_refine_channels 32
 --log_dir stone_weights
 --model_name my_stone_experiment_mm_v2
 --use_known_pose
@@ -27,7 +30,7 @@
 --gt_depth_weight 1.0
 --use_berhu_loss
 --gt_silog_weight 0.0
---gt_grad_weight 1.5
+--gt_grad_weight 2.0
 --gt_normal_weight 0.2
 --use_mask
 --stone_loss_weight 5.0
