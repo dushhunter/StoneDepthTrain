@@ -16,6 +16,7 @@ _SYNC_KEYS = (
     "min_depth", "max_depth", "dim_out", "query_nums", "patch_size",
     "model_dim", "dec_channels", "decoder_norm", "backbone", "model_type",
     "height", "width", "num_features", "num_layers",
+    "prob_temperature", "use_edge_refine", "edge_refine_channels",
 )
 
 
@@ -36,12 +37,21 @@ class SQLdepth(nn.Module):
         else:
             self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone=opt.backbone, in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels, decoder_norm=decoder_norm)
 
+        prob_temperature = getattr(self.opt, "prob_temperature", 1.0)
         if self.opt.backbone.endswith("_lite"):
             self.depth_decoder = networks.Lite_Depth_Decoder_QueryTr(in_channels=self.opt.model_dim, patch_size=self.opt.patch_size, dim_out=self.opt.dim_out, embedding_dim=self.opt.model_dim, 
                                                              query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth)
         else:
             self.depth_decoder = networks.Depth_Decoder_QueryTr(in_channels=self.opt.model_dim, patch_size=self.opt.patch_size, dim_out=self.opt.dim_out, embedding_dim=self.opt.model_dim, 
-                                                        query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth)
+                                                        query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth, prob_temperature=prob_temperature)
+
+        # Optional RGB-guided full-resolution refinement head (must match training).
+        if getattr(self.opt, "use_edge_refine", False):
+            self.refine = networks.EdgeRefine(
+                base_channels=getattr(self.opt, "edge_refine_channels", 32),
+                min_val=self.opt.min_depth, max_val=self.opt.max_depth)
+        else:
+            self.refine = None
 
         if self.opt.load_pretrained_model:
             self.load_pretrained_model()
@@ -111,10 +121,22 @@ class SQLdepth(nn.Module):
         # self.depth_decoder.load_state_dict(filtered_dict_enc)
         self.depth_decoder.load_state_dict(loaded_dict_enc)
 
+        if self.refine is not None:
+            refine_path = os.path.join(self.opt.load_pt_folder, "refine.pth")
+            if os.path.isfile(refine_path):
+                print("-> Loading edge refinement head from ", self.opt.load_pt_folder)
+                self.refine.load_state_dict(torch.load(refine_path, map_location=self.device))
+            else:
+                print("-> [warn] use_edge_refine set but no refine.pth found; "
+                      "refinement head is untrained (identity-ish).")
+
 
     def forward(self, x):
-        x = self.encoder(x)
-        return self.depth_decoder(x)["disp", 0]
+        feats = self.encoder(x)
+        disp = self.depth_decoder(feats)["disp", 0]
+        if self.refine is not None:
+            disp = self.refine(disp, x)
+        return disp
 
 class UpSampleBN(nn.Module):
     def __init__(self, skip_input, output_features):
@@ -584,6 +606,17 @@ class MonodepthOptions:
                                  help="normalization in the Unet decoder; MUST match training",
                                  default="batch",
                                  choices=["batch", "group"])
+        self.parser.add_argument("--prob_temperature",
+                                 type=float,
+                                 help="temperature for the depth-bin softmax; <1 sharpens edges; MUST match training",
+                                 default=1.0)
+        self.parser.add_argument("--use_edge_refine",
+                                 help="if set, apply the RGB-guided full-res edge refinement head; MUST match training",
+                                 action="store_true")
+        self.parser.add_argument("--edge_refine_channels",
+                                 type=int,
+                                 help="channel width of the edge refinement head; MUST match training",
+                                 default=32)
         self.parser.add_argument('--image_path', type=str,
                                 help='path to a test image or folder of images')
         self.parser.add_argument('--ext', type=str,
@@ -599,3 +632,6 @@ def convert_arg_line_to_args(arg_line):
         if not arg.strip():
             continue
         yield str(arg)
+
+
+
