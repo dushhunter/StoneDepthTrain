@@ -248,6 +248,21 @@ class MonodepthOptions:
                                        "synthetic specular highlights, noise) to the training images. Metric-safe: "
                                        "no geometric change, so GT depth/intrinsics stay valid."),
                                  action="store_true")
+        self.parser.add_argument("--prob_temperature",
+                                 type=float,
+                                 help=("temperature applied to the depth-bin softmax. Values <1 (e.g. 0.5) make the "
+                                       "per-pixel distribution peakier so the depth expectation stops averaging the "
+                                       "stone-edge cliff into a ramp. 1.0 keeps the original soft behaviour."),
+                                 default=1.0)
+        self.parser.add_argument("--use_edge_refine",
+                                 help=("if set, adds an RGB-guided full-resolution refinement head that fuses the "
+                                       "coarse (half-res) depth with sharp image features and predicts a residual, "
+                                       "recovering crisp stone silhouettes instead of bilinear-upsampled ramps."),
+                                 action="store_true")
+        self.parser.add_argument("--edge_refine_channels",
+                                 type=int,
+                                 help="channel width of the RGB-guided edge refinement head.",
+                                 default=32)
 
         # Multi-view learning enhancements
         self.parser.add_argument("--use_smoothness_loss",
