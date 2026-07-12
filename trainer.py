@@ -662,6 +662,9 @@ class Trainer:
 
         selection_metric = g_rmse  # fall back to scene RMSE if no mask
 
+        # Stone-region values (stay None when no foreground mask is available).
+        s_abs_rel = s_rmse = d1 = d2 = d5 = None
+
         if have_mask and s_n > 0:
             s_abs_rel = s_abs_rel_sum / s_n
             s_rmse = (s_se_sum / s_n) ** 0.5
@@ -688,7 +691,42 @@ class Trainer:
 
         self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
 
+        # Persist per-epoch validation metrics to a CSV for offline inspection.
+        self._append_val_metrics_csv(
+            g_abs_rel, g_rmse, s_abs_rel, s_rmse, d1, d2, d5)
+
         return selection_metric
+
+    def _append_val_metrics_csv(self, g_abs_rel, g_rmse,
+                                s_abs_rel, s_rmse, d1, d2, d5):
+        """Append one row of validation metrics per epoch to val_metrics.csv.
+
+        Written to {log_path}/val_metrics.csv. Stone-region columns are left
+        blank for epochs where no foreground mask was available.
+        """
+        csv_path = os.path.join(self.log_path, "val_metrics.csv")
+        header = ["epoch", "scene_abs_rel", "scene_rmse_m", "scene_rmse_mm",
+                  "stone_abs_rel", "stone_rmse_m", "stone_rmse_mm",
+                  "stone_within_1mm", "stone_within_2mm", "stone_within_5mm"]
+
+        def _fmt(v, mm=False, prec=6):
+            if v is None:
+                return ""
+            return "{:.{p}f}".format(v * (1000.0 if mm else 1.0), p=prec)
+
+        row = [
+            str(self.epoch),
+            _fmt(g_abs_rel), _fmt(g_rmse), _fmt(g_rmse, mm=True, prec=3),
+            _fmt(s_abs_rel), _fmt(s_rmse), _fmt(s_rmse, mm=True, prec=3),
+            _fmt(d1, prec=4), _fmt(d2, prec=4), _fmt(d5, prec=4),
+        ]
+
+        write_header = not os.path.isfile(csv_path)
+        with open(csv_path, "a") as f:
+            if write_header:
+                f.write(",".join(header) + "\n")
+            f.write(",".join(row) + "\n")
+        print("  -> val metrics appended to {}".format(csv_path))
 
     @staticmethod
     def _to_scalar(value):
