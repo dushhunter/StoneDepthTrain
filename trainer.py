@@ -90,12 +90,13 @@ class Trainer:
         # self.models["encoder"].to(self.device)
         
         
+        prob_temperature = getattr(self.opt, "prob_temperature", 1.0)
         if self.opt.backbone.endswith("_lite"):
             self.models["depth"] = networks.Lite_Depth_Decoder_QueryTr(in_channels=self.opt.model_dim, patch_size=self.opt.patch_size, dim_out=self.opt.dim_out, embedding_dim=self.opt.model_dim, 
                                                                     query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth)
         else:
             self.models["depth"] = networks.Depth_Decoder_QueryTr(in_channels=self.opt.model_dim, patch_size=self.opt.patch_size, dim_out=self.opt.dim_out, embedding_dim=self.opt.model_dim, 
-                                                                    query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth)
+                                                                    query_nums=self.opt.query_nums, num_heads=4, min_val=self.opt.min_depth, max_val=self.opt.max_depth, prob_temperature=prob_temperature)
 
         if self.opt.load_pretrained_model:
             print("-> Loading pretrained depth decoder from ", self.opt.load_pt_folder)
@@ -127,6 +128,18 @@ class Trainer:
         self.models["depth"] = torch.nn.DataParallel(self.models["depth"])
         # self.models["pose"].to(self.device)
         self.models["pose"] = self.models["pose"].cuda()
+
+        # RGB-guided full-resolution refinement head. The depth decoder predicts
+        # a half-resolution soft-binned map that blurs stone silhouettes when
+        # upsampled; this head fuses the coarse depth with sharp RGB features and
+        # predicts a residual to recover crisp edges at full input resolution.
+        if getattr(self.opt, "use_edge_refine", False):
+            self.models["refine"] = networks.EdgeRefine(
+                base_channels=getattr(self.opt, "edge_refine_channels", 32),
+                min_val=self.opt.min_depth, max_val=self.opt.max_depth)
+            self.models["refine"] = self.models["refine"].cuda()
+            self.models["refine"] = torch.nn.DataParallel(self.models["refine"])
+            self.parameters_to_train += list(self.models["refine"].parameters())
 
         #self.models["pose"] = torch.nn.DataParallel(self.models["pose"])
         if self.opt.diff_lr :
@@ -430,6 +443,12 @@ class Trainer:
 
             outputs = self.models["depth"](features)
 
+        # Refine the coarse depth to full resolution using the input image as an
+        # edge guide, so all downstream losses supervise the sharp map directly.
+        if "refine" in self.models:
+            outputs[("disp", 0)] = self.models["refine"](
+                outputs[("disp", 0)], inputs[("color", 0, 0)])
+
         if self.opt.predictive_mask: # default no
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
         # self.use_pose_net = not (self.opt.use_stereo and self.opt.frame_ids == [0])
@@ -571,6 +590,9 @@ class Trainer:
 
                 features = self.models["encoder"](inputs["color_aug", 0, 0])
                 outputs = self.models["depth"](features)
+                if "refine" in self.models:
+                    outputs[("disp", 0)] = self.models["refine"](
+                        outputs[("disp", 0)], inputs[("color", 0, 0)])
 
                 if "depth_gt" not in inputs:
                     self.set_train()
