@@ -6,9 +6,13 @@ import torch.nn as nn
 from .layers import PixelWiseDotProduct_for_dense, PixelWiseDotProduct_for_summary, FullQueryLayer
 class Depth_Decoder_QueryTr(nn.Module):
     def __init__(self, in_channels, embedding_dim=128, patch_size=16, num_heads=4, query_nums=100, dim_out=256, norm='linear',
-                 min_val=0.001, max_val=10) -> None:
+                 min_val=0.001, max_val=10, prob_temperature=1.0) -> None:
         super(Depth_Decoder_QueryTr, self).__init__()
         self.norm = norm
+        # Temperature (<1) sharpens the per-pixel bin distribution so the depth
+        # expectation approaches an argmax, stopping stone-edge cliffs from being
+        # averaged into a ramp. 1.0 reproduces the original soft behaviour.
+        self.prob_temperature = prob_temperature
         self.embedding_convPxP = nn.Conv2d(in_channels, embedding_dim,
                                            kernel_size=patch_size, stride=patch_size, padding=0)
         self.positional_encodings = nn.Parameter(torch.rand(500, embedding_dim), requires_grad=True)
@@ -67,7 +71,10 @@ class Depth_Decoder_QueryTr(nn.Module):
             y = torch.sigmoid(y)
         y = y / y.sum(dim=1, keepdim=True)
         
-        out = self.convert_to_prob(energy_maps)
+        # convert_to_prob = [Conv2d, Softmax]; apply the conv then a temperature
+        # softmax so we can sharpen the distribution without new parameters.
+        logits = self.convert_to_prob[0](energy_maps)
+        out = torch.softmax(logits / self.prob_temperature, dim=1)
         bin_widths = (self.max_val - self.min_val) * y 
         bin_widths = nn.functional.pad(bin_widths, (1, 0), mode='constant', value=self.min_val)
         bin_edges = torch.cumsum(bin_widths, dim=1) 
