@@ -162,12 +162,13 @@ class Trainer:
         #     self.models["predictive_mask"].to(self.device)
         #     self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
+        weight_decay = getattr(self.opt, "weight_decay", 0.0)
         if self.opt.diff_lr :
             df_params = [{"params": self.pose_params, "lr": self.opt.learning_rate / 10},
                       {"params": self.parameters_to_train, "lr": self.opt.learning_rate}]
-            self.model_optimizer = optim.Adam(df_params, lr=self.opt.learning_rate)
+            self.model_optimizer = optim.AdamW(df_params, lr=self.opt.learning_rate, weight_decay=weight_decay)
         else : 
-            self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate) # default=1e-4
+            self.model_optimizer = optim.AdamW(self.parameters_to_train, lr=self.opt.learning_rate, weight_decay=weight_decay) # default lr=1e-4
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1) # default=15
 
@@ -205,7 +206,11 @@ class Trainer:
                 gt_depth_subdir=self.opt.gt_depth_subdir,
                 gt_depth_encoding=self.opt.gt_depth_encoding,
                 gt_depth_scale=self.opt.gt_depth_scale,
-                use_strong_aug=getattr(self.opt, "use_strong_aug", False))
+                use_strong_aug=getattr(self.opt, "use_strong_aug", False),
+                use_crop_aug=getattr(self.opt, "use_crop_aug", False),
+                use_scale_aug=getattr(self.opt, "use_scale_aug", False),
+                scale_aug_max=getattr(self.opt, "scale_aug_max", 1.15),
+                scale_aug_prob=getattr(self.opt, "scale_aug_prob", 0.5))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             train_dataset = self.dataset(
             self.opt.intrinsics_file_path, self.opt.data_path, train_filenames,  # StoneVol_main: pass intrinsics file first
