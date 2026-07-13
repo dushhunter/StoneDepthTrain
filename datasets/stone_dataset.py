@@ -49,7 +49,8 @@ class StoneDataset(MonoDatasetMultiCam):
                  use_mask=False, use_gt_depth=False, gt_depth_path=None,
                  gt_depth_subdir="data_depth_annotated/train/groundtruth",
                  gt_depth_encoding="auto", gt_depth_scale=100000.0,
-                 use_strong_aug=False, **kwargs):
+                 use_strong_aug=False, use_crop_aug=False, use_scale_aug=False,
+                 scale_aug_max=1.15, scale_aug_prob=0.5, **kwargs):
         # `*args` / `**kwargs` are forwarded to the base class. For StoneDataset, the
         # base constructor comes from MonoDatasetMultiCam and typically includes:
         #   (intrinsics_file_path, data_path, filenames, height, width, frame_idxs, num_scales, ...)
@@ -65,6 +66,14 @@ class StoneDataset(MonoDatasetMultiCam):
         self.gt_depth_encoding = gt_depth_encoding  # auto | uint16 | float32_rgba
         self.gt_depth_scale = float(gt_depth_scale)  # uint16 PNG → metres divisor (default 100000)
         self.use_strong_aug = use_strong_aug  # sim2real domain-randomization augmentation
+        # Geometric zoom augmentation to fight per-scene scale memorization.
+        #   use_crop_aug : digital zoom-in crop, GT depth unchanged (exact, metric-safe).
+        #   use_scale_aug: same crop but GT depth *= 1/s (dolly zoom -> varies absolute
+        #                  scale so the net learns size<->depth from perspective).
+        self.use_crop_aug = use_crop_aug
+        self.use_scale_aug = use_scale_aug
+        self.scale_aug_max = float(scale_aug_max)
+        self.scale_aug_prob = float(scale_aug_prob)
         self.interp_mask = Image.NEAREST  # keep masks discrete (no interpolation blending)
         self.mask_resize = {}  # per-scale resize transforms for masks
 
@@ -117,6 +126,41 @@ class StoneDataset(MonoDatasetMultiCam):
         if random.random() < 0.4:
             t = self._add_specular(t)
         return t.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _zoom_box(w, h, scale_crop):
+        """Pixel crop box (left, upper, right, lower) for a normalized zoom spec."""
+        u0, v0, frac, _s = scale_crop
+        left = int(round(u0 * w))
+        upper = int(round(v0 * h))
+        right = int(round((u0 + frac) * w))
+        lower = int(round((v0 + frac) * h))
+        right = max(right, left + 1)
+        lower = max(lower, upper + 1)
+        return left, upper, right, lower
+
+    def _apply_zoom_pil(self, img, scale_crop, resample):
+        """Digital zoom-in on a PIL image: crop the normalized box, resize back to
+        the original size. Geometry-preserving (no depth change here)."""
+        if scale_crop is None:
+            return img
+        w, h = img.size
+        box = self._zoom_box(w, h, scale_crop)
+        return img.crop(box).resize((w, h), resample)
+
+    def _apply_zoom_depth(self, depth_np, scale_crop):
+        """Digital zoom-in on a float32 depth map, then (for scale/dolly aug) scale
+        the metric depth by 1/s to simulate the camera moving closer."""
+        if scale_crop is None:
+            return depth_np
+        h, w = depth_np.shape
+        left, upper, right, lower = self._zoom_box(w, h, scale_crop)
+        dpil = Image.fromarray(depth_np, mode="F")
+        dpil = dpil.crop((left, upper, right, lower)).resize((w, h), Image.NEAREST)
+        out = np.array(dpil, dtype=np.float32)
+        if self.use_scale_aug:
+            out = out / float(scale_crop[3])  # depth *= 1/s (dolly zoom)
+        return out
 
     def preprocess(self, inputs, color_aug):
         """Convert PIL images to tensors and build image/mask pyramids.
@@ -189,17 +233,29 @@ class StoneDataset(MonoDatasetMultiCam):
         do_color_aug = self.is_train and random.random() > 0.5  # apply color jitter only during training
         do_flip = self.is_train and random.random() > 0.5  # random horizontal flip only during training
 
+        # Geometric zoom augmentation (train only). Choose one random normalized crop
+        # box + zoom factor s, applied identically to every color/mask/depth so they
+        # stay pixel-aligned. Zoom-in only (s>=1) to avoid padding.
+        scale_crop = None
+        if self.is_train and (self.use_crop_aug or self.use_scale_aug) \
+                and random.random() < self.scale_aug_prob and self.scale_aug_max > 1.0:
+            s = random.uniform(1.0, self.scale_aug_max)
+            frac = 1.0 / s
+            u0 = random.uniform(0.0, 1.0 - frac)
+            v0 = random.uniform(0.0, 1.0 - frac)
+            scale_crop = (u0, v0, frac, s)
+
         line = self.filenames[index].split()  # split line like "stone_01 1" into [folder, frame]
         folder = line[0]  # sequence folder name (e.g., "stone_01")
         frame_index = int(line[1]) if len(line) > 1 else 0  # target frame index within the folder
 
         # Load target and source colors. We store them at scale=-1 first (native/original resolution).
         for i in self.frame_idxs:  # e.g., [-1, 0, +1]
-            inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, do_flip)  # PIL RGB
+            inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, do_flip, scale_crop)  # PIL RGB
 
         # Load target mask only when enabled (frame_id=0); source frames do not need masks.
         if self.use_mask:
-            inputs[("mask", 0, -1)] = self.get_mask(folder, frame_index, do_flip)  # PIL grayscale
+            inputs[("mask", 0, -1)] = self.get_mask(folder, frame_index, do_flip, scale_crop)  # PIL grayscale
 
         # Intrinsics per scale (use per-folder key). K values are stored in normalized units
         # in the file, then scaled here by the current training resolution for each pyramid scale.
@@ -236,12 +292,12 @@ class StoneDataset(MonoDatasetMultiCam):
         # Load GT metric depth for the target frame (after preprocess, so not part of image pyramid).
         # Stored as a float32 tensor [1, H, W] in metres; used by the trainer for supervised loss.
         if self.use_gt_depth and self.gt_depth_path is not None:
-            depth_np = self.get_gt_depth(folder, frame_index, do_flip)  # float32 metres
+            depth_np = self.get_gt_depth(folder, frame_index, do_flip, scale_crop)  # float32 metres
             inputs["depth_gt"] = torch.from_numpy(depth_np).unsqueeze(0)  # [1, H, W]
 
         return inputs  # dict consumed by Trainer and the networks
 
-    def get_color(self, folder, frame_index, do_flip):
+    def get_color(self, folder, frame_index, do_flip, scale_crop=None):
         """Load one RGB frame as a PIL image.
 
         stone_syn_dataset naming: images are stored directly in the folder root
@@ -252,6 +308,7 @@ class StoneDataset(MonoDatasetMultiCam):
         color = pil_loader(image_path)  # load RGB image via shared loader
         if do_flip:  # optionally mirror image horizontally
             color = color.transpose(Image.FLIP_LEFT_RIGHT)
+        color = self._apply_zoom_pil(color, scale_crop, Image.BILINEAR)  # optional zoom aug
         return color  # PIL.Image in RGB mode
 
     def _decode_float32_rgba_depth(self, depth_img):
@@ -264,7 +321,7 @@ class StoneDataset(MonoDatasetMultiCam):
         depth = rgba.reshape(-1, 4).view("<f4").reshape(h, w).copy()
         return depth
 
-    def get_gt_depth(self, folder, frame_index, do_flip):
+    def get_gt_depth(self, folder, frame_index, do_flip, scale_crop=None):
         """Load GT metric depth PNG for the target frame.
 
         GT depths live at: {gt_depth_path}/{gt_depth_subdir}/{folder}/depth_{frame:04d}.png
@@ -287,18 +344,19 @@ class StoneDataset(MonoDatasetMultiCam):
 
         encoding = self.gt_depth_encoding
         if encoding == "float32_rgba":
-            return self._decode_float32_rgba_depth(depth_pil).astype(np.float32)
-
-        if encoding == "uint16":
-            return np.array(depth_pil, dtype=np.float32) / self.gt_depth_scale
-
+            depth_np = self._decode_float32_rgba_depth(depth_pil).astype(np.float32)
+        elif encoding == "uint16":
+            depth_np = np.array(depth_pil, dtype=np.float32) / self.gt_depth_scale
         # Auto-detect: RGBA means float32-packed depth; otherwise legacy uint16/int depth.
-        if depth_pil.mode == "RGBA":
-            return self._decode_float32_rgba_depth(depth_pil).astype(np.float32)
+        elif depth_pil.mode == "RGBA":
+            depth_np = self._decode_float32_rgba_depth(depth_pil).astype(np.float32)
+        else:
+            depth_np = np.array(depth_pil, dtype=np.float32) / self.gt_depth_scale
 
-        return np.array(depth_pil, dtype=np.float32) / self.gt_depth_scale
+        # Apply the same zoom crop as the RGB/mask (and depth rescale for scale aug).
+        return self._apply_zoom_depth(depth_np, scale_crop)
 
-    def get_mask(self, folder, frame_index, do_flip):
+    def get_mask(self, folder, frame_index, do_flip, scale_crop=None):
         """Load one target-frame mask as a PIL image (grayscale)."""
         mask_dir = os.path.join(self.data_path, folder, "masks")
         # Prefer 4-digit names (mask_0001.png), then fall back to legacy 2-digit names.
@@ -323,6 +381,7 @@ class StoneDataset(MonoDatasetMultiCam):
         mask = pil_loader(mask_path).convert("L")  # ensure 1-channel grayscale
         if do_flip:  # apply same flip as the RGB image so they stay aligned
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        mask = self._apply_zoom_pil(mask, scale_crop, Image.NEAREST)  # optional zoom aug (keep discrete)
         return mask  # PIL.Image in L mode
 
     def get_intrinsics(self, folder):
