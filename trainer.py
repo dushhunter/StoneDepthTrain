@@ -274,12 +274,31 @@ class Trainer:
 
         self.save_opts()
 
-    def _turntable_transform(self, frame_id_offset):
+    def _turntable_axis_depth(self, inputs):
+        """Return the camera-to-turntable-axis distance (metres) used for the warp.
+
+        If --turntable_axis_depth is positive, use it directly. Otherwise auto-estimate
+        it from the median of the valid stone GT depth in this batch (GT is available
+        during training); fall back to the middle of the depth range if no GT.
+        """
+        if getattr(self.opt, "turntable_axis_depth", -1.0) > 0:
+            return float(self.opt.turntable_axis_depth)
+        if "depth_gt" in inputs:
+            d = inputs["depth_gt"]
+            valid = (d > self.opt.min_depth) & (d < self.opt.max_depth)
+            if valid.any():
+                return float(torch.median(d[valid]).item())
+        return 0.5 * (self.opt.min_depth + self.opt.max_depth)
+
+    def _turntable_transform(self, frame_id_offset, axis_depth):
         """Return a batched 4x4 rigid transform for a turntable offset of frame_id_offset frames.
 
         Camera is fixed; the object rotates by turntable_angle_deg per frame around the Y-axis.
-        From the camera perspective, a point visible in frame 0 at position X appears at
-        Ry(angle) * X in the source/target frame at offset frame_id_offset.
+        The rotation axis sits at the object, not the camera origin, so the correct
+        camera-frame map is X' = R*X + (I - R)*c, where c is the axis position in camera
+        coordinates: c = [axis_offset_x, 0, axis_depth]. Dropping the (I - R)*c translation
+        (pure rotation about the camera origin) shifts neighbour frames by ~sin(angle)*depth
+        and makes the photometric consistency loss inconsistent.
         """
         angle_rad = frame_id_offset * self.opt.turntable_angle_deg * math.pi / 180.0
         cos_a = math.cos(angle_rad)
@@ -292,7 +311,15 @@ class Trainer:
              [   0.0, 0.0,   0.0, 1.0]],
             dtype=torch.float32, device=self.device,
         )
-        return R.unsqueeze(0).expand(self.opt.batch_size, -1, -1)  # [B, 4, 4]
+        # Rotation centre (turntable axis) in camera coordinates.
+        cx = float(getattr(self.opt, "turntable_axis_offset_x", 0.0))
+        c = torch.tensor([cx, 0.0, float(axis_depth)], dtype=torch.float32, device=self.device)
+        # t = (I - R3x3) @ c  -> rotate about the axis instead of the camera origin.
+        R3 = R[:3, :3]
+        t = (torch.eye(3, dtype=torch.float32, device=self.device) - R3) @ c
+        T = R.clone()
+        T[:3, 3] = t
+        return T.unsqueeze(0).expand(self.opt.batch_size, -1, -1)  # [B, 4, 4]
 
     def set_train(self):
         """Convert all models to training mode
@@ -475,12 +502,13 @@ class Trainer:
 
         # Stone / turntable shortcut: bypass PoseCNN entirely and return known transforms.
         if self.opt.use_known_pose:
+            axis_depth = self._turntable_axis_depth(inputs)
             dummy = torch.zeros(self.opt.batch_size, 1, 1, 3, device=self.device)
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
                     outputs[("axisangle", 0, f_i)] = dummy
                     outputs[("translation", 0, f_i)] = dummy
-                    outputs[("cam_T_cam", 0, f_i)] = self._turntable_transform(f_i)
+                    outputs[("cam_T_cam", 0, f_i)] = self._turntable_transform(f_i, axis_depth)
             return outputs
 
         if self.num_pose_frames == 2:
@@ -971,31 +999,36 @@ class Trainer:
             return torch.tensor(0.0, device=self.device)
         
         try:
-            consistency_loss = torch.tensor(0.0, device=self.device)
-            valid_terms = 0
             scale = 0  # Use single scale
-            
-            # Get depth prediction for reference frame
-            depth_ref = outputs[("depth", 0, scale)]  # [B, 1, H, W]
             img_ref = inputs[("color", 0, scale)]      # [B, 3, H, W]
-            
-            # Forward warp (frame 0 -> frame +1)
+
+            # Per-pixel photometric reprojection error for each available neighbour.
+            reproj = []
             if ("color", 1, scale) in outputs:
-                img_warped_fwd = outputs[("color", 1, scale)]
-                photo_loss_fwd = self.compute_reprojection_loss(img_warped_fwd, img_ref)
-                consistency_loss += photo_loss_fwd.mean()
-                valid_terms += 1
-            
-            # Backward warp (frame 0 -> frame -1)
+                reproj.append(
+                    self.compute_reprojection_loss(outputs[("color", 1, scale)], img_ref))
             if ("color", -1, scale) in outputs:
-                img_warped_bwd = outputs[("color", -1, scale)]
-                photo_loss_bwd = self.compute_reprojection_loss(img_warped_bwd, img_ref)
-                consistency_loss += photo_loss_bwd.mean()
-                valid_terms += 1
-            
-            if valid_terms == 0:
+                reproj.append(
+                    self.compute_reprojection_loss(outputs[("color", -1, scale)], img_ref))
+
+            if len(reproj) == 0:
                 return torch.tensor(0.0, device=self.device)
-            return consistency_loss / float(valid_terms)
+
+            # Occlusion-robust: keep the best-matching neighbour per pixel (min, not mean).
+            reproj = torch.cat(reproj, dim=1)          # [B, N, H, W]
+            per_pixel, _ = reproj.min(dim=1, keepdim=True)  # [B, 1, H, W]
+
+            # Restrict to the foreground stone: specular highlights and the (moving)
+            # background violate brightness constancy and would corrupt the constraint.
+            mask = None
+            if self.opt.use_mask and (("mask", 0, scale) in inputs):
+                mask = inputs[("mask", 0, scale)]
+                if mask.shape[-2:] != per_pixel.shape[-2:]:
+                    mask = F.interpolate(mask, size=per_pixel.shape[-2:], mode="nearest")
+            if mask is not None:
+                denom = mask.sum().clamp(min=1.0)
+                return (per_pixel * mask).sum() / denom
+            return per_pixel.mean()
         except Exception:
             # Silently fail if frames not available
             return torch.tensor(0.0, device=self.device)
@@ -1251,8 +1284,10 @@ class Trainer:
 
         # ENHANCEMENT #1: Multi-view consistency loss (photometric)
         # For turntable data, enforces geometric consistency across views.
-        # Photometric, so disabled when training fully GT-supervised.
-        if use_photometric and getattr(self.opt, 'use_multiview_loss', False):
+        # This runs on top of GT supervision (independent of --use_photometric): it is a
+        # masked, metric-scale cross-view constraint, NOT the full monocular self-supervised
+        # reprojection loop (which fights absolute scale / specular gem highlights).
+        if getattr(self.opt, 'use_multiview_loss', False):
             consistency = self.compute_multiview_consistency_loss(inputs, outputs)
             if consistency > 0:
                 losses["loss/consistency"] = consistency
