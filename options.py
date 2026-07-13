@@ -263,6 +263,32 @@ class MonodepthOptions:
                                  type=int,
                                  help="channel width of the RGB-guided edge refinement head.",
                                  default=32)
+        self.parser.add_argument("--weight_decay",
+                                 type=float,
+                                 help=("AdamW weight decay (L2 regularization). Helps prevent the high-capacity "
+                                       "network from memorizing the few training scenes; try ~1e-2. 0.0 = plain Adam."),
+                                 default=0.0)
+        self.parser.add_argument("--use_crop_aug",
+                                 help=("if set, applies a metric-safe random digital-zoom crop (crop a sub-window "
+                                       "and resize back to HxW). GT depth values are unchanged, so it is exact; it "
+                                       "only varies apparent object scale/framing to reduce memorization."),
+                                 action="store_true")
+        self.parser.add_argument("--use_scale_aug",
+                                 help=("if set, applies a dolly-zoom augmentation: like the crop but ALSO multiplies "
+                                       "GT depth by 1/s, simulating the camera moving closer. This creates consistent "
+                                       "object-size<->depth pairs so the net learns scale from perspective instead of "
+                                       "memorizing each scene's absolute depth. Overrides --use_crop_aug when set."),
+                                 action="store_true")
+        self.parser.add_argument("--scale_aug_max",
+                                 type=float,
+                                 help=("maximum zoom-in factor s for --use_crop_aug/--use_scale_aug (s sampled in "
+                                       "[1.0, scale_aug_max]). Keep modest (e.g. 1.15) so rescaled stone depths do "
+                                       "not fall below --min_depth."),
+                                 default=1.15)
+        self.parser.add_argument("--scale_aug_prob",
+                                 type=float,
+                                 help="probability of applying the crop/scale zoom augmentation per training sample.",
+                                 default=0.5)
 
         # Multi-view learning enhancements
         self.parser.add_argument("--use_smoothness_loss",
