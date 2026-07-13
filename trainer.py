@@ -563,6 +563,38 @@ class Trainer:
 
         self.set_train()
 
+    @staticmethod
+    def _fit_plane(depth_2d, bg_mask_2d, min_pixels=64):
+        """Least-squares fit of a plane z = a*u + b*v + c to depth over a mask.
+
+        u, v are pixel coordinates normalized to [0, 1]. Returns the fitted plane
+        as a full [H, W] depth map, or None if there are too few background pixels.
+        Used to measure the stone's height above its local background plane, which
+        is invariant to the absolute depth scale and the plane's pose.
+        """
+        H, W = depth_2d.shape
+        device = depth_2d.device
+        m = bg_mask_2d.reshape(-1)
+        if m.sum().item() < min_pixels:
+            return None
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij")
+        u = (xs / max(W - 1, 1)).reshape(-1)
+        v = (ys / max(H - 1, 1)).reshape(-1)
+        A = torch.stack([u, v, torch.ones_like(u)], dim=1)  # [H*W, 3]
+        z = depth_2d.reshape(-1)
+        A_bg = A[m]
+        z_bg = z[m].unsqueeze(1)
+        try:
+            sol = torch.linalg.lstsq(A_bg, z_bg).solution  # [3, 1]
+        except Exception:
+            # Normal-equation fallback for older torch / singular systems.
+            ata = A_bg.t() @ A_bg
+            sol = torch.linalg.pinv(ata) @ (A_bg.t() @ z_bg)
+        return (A @ sol).reshape(H, W)
+
     def validate_full_epoch(self):
         """Run validation over the entire val set.
 
@@ -587,6 +619,13 @@ class Trainer:
         s_n = 0.0
         s_within = {1.0: 0.0, 2.0: 0.0, 5.0: 0.0}  # mm thresholds
         have_mask = False
+        # Scale/shape decomposition accumulators (stone region, per-image):
+        #   sms_*    : median-scaled stone SE (removes global depth scale)
+        #   relief_* : plane-relative stone SE (removes scale AND plane pose)
+        sms_se_sum = 0.0
+        sms_n = 0.0
+        relief_se_sum = 0.0
+        relief_n = 0.0
 
         with torch.no_grad():
             for inputs in self.val_loader:
@@ -646,6 +685,34 @@ class Trainer:
                         for thr in s_within:
                             s_within[thr] += float((abs_err_mm < thr).sum().item())
 
+                    # Scale/shape decomposition, computed per image in the batch.
+                    for b in range(depth_gt.shape[0]):
+                        gt_b = depth_gt[b, 0]
+                        pred_b = depth_pred[b, 0]
+                        valid_b = valid[b, 0]
+                        stone_b = stone_valid[b, 0]
+                        if stone_b.sum().item() == 0 or valid_b.sum().item() == 0:
+                            continue
+                        gt_sb = gt_b[stone_b]
+
+                        # (1) Median-scaled: align global scale, then stone SE.
+                        pred_med = torch.median(pred_b[valid_b]).clamp(min=1e-6)
+                        scale = torch.median(gt_b[valid_b]) / pred_med
+                        pred_sb_scaled = pred_b[stone_b] * scale
+                        sms_se_sum += ((pred_sb_scaled - gt_sb) ** 2).sum().item()
+                        sms_n += float(stone_b.sum().item())
+
+                        # (2) Plane-relative: subtract each map's own background plane,
+                        # then compare stone height-above-plane (scale+pose invariant).
+                        bg_b = valid_b & (~stone_b)
+                        plane_pred = self._fit_plane(pred_b, bg_b)
+                        plane_gt = self._fit_plane(gt_b, bg_b)
+                        if plane_pred is not None and plane_gt is not None:
+                            relief_pred = pred_b[stone_b] - plane_pred[stone_b]
+                            relief_gt = gt_b[stone_b] - plane_gt[stone_b]
+                            relief_se_sum += ((relief_pred - relief_gt) ** 2).sum().item()
+                            relief_n += float(stone_b.sum().item())
+
         self.set_train()
 
         if g_n == 0:
@@ -669,6 +736,9 @@ class Trainer:
 
         # Stone-region values (stay None when no foreground mask is available).
         s_abs_rel = s_rmse = d1 = d2 = d5 = None
+        # Scale/shape decomposition RMSEs in mm (None if not computed).
+        s_rmse_medscaled_mm = (sms_se_sum / sms_n) ** 0.5 * 1000 if sms_n > 0 else None
+        s_relief_rmse_mm = (relief_se_sum / relief_n) ** 0.5 * 1000 if relief_n > 0 else None
 
         if have_mask and s_n > 0:
             s_abs_rel = s_abs_rel_sum / s_n
@@ -694,16 +764,34 @@ class Trainer:
             })
             selection_metric = s_rmse  # select best model on stone-region RMSE
 
+        # Scale/shape decomposition: shows whether the big absolute error is a
+        # fixable global scale (median-scaled small) or true stone shape error.
+        if s_rmse_medscaled_mm is not None or s_relief_rmse_mm is not None:
+            ms = -1.0 if s_rmse_medscaled_mm is None else s_rmse_medscaled_mm
+            rl = -1.0 if s_relief_rmse_mm is None else s_relief_rmse_mm
+            print("    stone scale/shape: median_scaled_rmse={:.3f}mm  "
+                  "plane_relief_rmse={:.3f}mm".format(ms, rl))
+            if s_rmse_medscaled_mm is not None:
+                self.writers["val"].add_scalar(
+                    "epoch/stone_rmse_medscaled_mm", s_rmse_medscaled_mm, self.epoch)
+                mlflow_metrics["stone_rmse_medscaled_mm"] = s_rmse_medscaled_mm
+            if s_relief_rmse_mm is not None:
+                self.writers["val"].add_scalar(
+                    "epoch/stone_relief_rmse_mm", s_relief_rmse_mm, self.epoch)
+                mlflow_metrics["stone_relief_rmse_mm"] = s_relief_rmse_mm
+
         self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
 
         # Persist per-epoch validation metrics to a CSV for offline inspection.
         self._append_val_metrics_csv(
-            g_abs_rel, g_rmse, s_abs_rel, s_rmse, d1, d2, d5)
+            g_abs_rel, g_rmse, s_abs_rel, s_rmse, d1, d2, d5,
+            s_rmse_medscaled_mm, s_relief_rmse_mm)
 
         return selection_metric
 
     def _append_val_metrics_csv(self, g_abs_rel, g_rmse,
-                                s_abs_rel, s_rmse, d1, d2, d5):
+                                s_abs_rel, s_rmse, d1, d2, d5,
+                                s_rmse_medscaled_mm=None, s_relief_rmse_mm=None):
         """Append one row of validation metrics per epoch to val_metrics.csv.
 
         Written to {log_path}/val_metrics.csv. Stone-region columns are left
@@ -712,7 +800,8 @@ class Trainer:
         csv_path = os.path.join(self.log_path, "val_metrics.csv")
         header = ["epoch", "scene_abs_rel", "scene_rmse_m", "scene_rmse_mm",
                   "stone_abs_rel", "stone_rmse_m", "stone_rmse_mm",
-                  "stone_within_1mm", "stone_within_2mm", "stone_within_5mm"]
+                  "stone_within_1mm", "stone_within_2mm", "stone_within_5mm",
+                  "stone_rmse_medscaled_mm", "stone_relief_rmse_mm"]
 
         def _fmt(v, mm=False, prec=6):
             if v is None:
@@ -724,6 +813,7 @@ class Trainer:
             _fmt(g_abs_rel), _fmt(g_rmse), _fmt(g_rmse, mm=True, prec=3),
             _fmt(s_abs_rel), _fmt(s_rmse), _fmt(s_rmse, mm=True, prec=3),
             _fmt(d1, prec=4), _fmt(d2, prec=4), _fmt(d5, prec=4),
+            _fmt(s_rmse_medscaled_mm, prec=3), _fmt(s_relief_rmse_mm, prec=3),
         ]
 
         write_header = not os.path.isfile(csv_path)
