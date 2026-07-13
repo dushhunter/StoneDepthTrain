@@ -173,6 +173,18 @@ class MonodepthOptions:
                                  type=float,
                                  help="turntable rotation angle per frame in degrees (positive = object rotates right)",
                                  default=3.0)
+        self.parser.add_argument("--turntable_axis_depth",
+                                 type=float,
+                                 help=("camera-to-turntable-axis distance in metres (the z of the rotation "
+                                       "centre in camera coordinates). Used to build the correct rigid transform "
+                                       "X' = R*X + (I-R)*c for the known-pose warp. <=0 means auto-estimate from "
+                                       "the median valid stone GT depth per batch."),
+                                 default=-1.0)
+        self.parser.add_argument("--turntable_axis_offset_x",
+                                 type=float,
+                                 help=("lateral (camera x) offset of the turntable axis in metres. 0 assumes the "
+                                       "rotation axis lies on the optical axis (stone roughly image-centred)."),
+                                 default=0.0)
         self.parser.add_argument("--use_gt_depth",
                                  help="if set, supervises training with GT metric depth maps",
                                  action="store_true")
