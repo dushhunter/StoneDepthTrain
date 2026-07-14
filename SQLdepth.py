@@ -636,6 +636,29 @@ class MonodepthOptions:
                                        "are excluded from the background-plane fit for a cleaner anchor."),
                                  default="")
 
+        # ---- Cost-volume MVS inference (test_mvs.py) ----
+        self.parser.add_argument("--use_mvs",
+                                 help="load and run the cost-volume MVS head instead of the monocular head",
+                                 action="store_true")
+        self.parser.add_argument("--mvs_frame_offsets",
+                                 nargs="+", type=int,
+                                 help="turntable frame offsets used as MVS source views (e.g. -8 -4 4 8)",
+                                 default=[-8, -4, 4, 8])
+        self.parser.add_argument("--mvs_num_depth_coarse", type=int, default=48)
+        self.parser.add_argument("--mvs_num_depth_fine", type=int, default=48)
+        self.parser.add_argument("--mvs_fine_range_mm", type=float, default=20.0)
+        self.parser.add_argument("--mvs_feature_ch", type=int, default=32)
+        self.parser.add_argument("--mvs_num_groups", type=int, default=8)
+        self.parser.add_argument("--mvs_feat_scale", type=int, default=8)
+        self.parser.add_argument("--frames_per_seq", type=int, default=120)
+        self.parser.add_argument("--intrinsics_file_path", type=str, default="",
+                                 help="per-folder KV intrinsics file (same format as training)")
+        self.parser.add_argument("--use_known_pose", action="store_true",
+                                 help="use deterministic turntable transforms for the MVS warp")
+        self.parser.add_argument("--turntable_angle_deg", type=float, default=3.0)
+        self.parser.add_argument("--turntable_axis_depth", type=float, default=-1.0)
+        self.parser.add_argument("--turntable_axis_offset_x", type=float, default=0.0)
+
 
     def parse(self):
         self.options = self.parser.parse_args()
