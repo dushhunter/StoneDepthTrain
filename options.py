@@ -185,6 +185,47 @@ class MonodepthOptions:
                                  help=("lateral (camera x) offset of the turntable axis in metres. 0 assumes the "
                                        "rotation axis lies on the optical axis (stone roughly image-centred)."),
                                  default=0.0)
+
+        # ---- Cost-volume MVS head (mm-accurate depth from known-pose views) ----
+        self.parser.add_argument("--use_mvs",
+                                 help=("if set, replaces the monocular depth head with a cascade plane-sweep "
+                                       "multi-view-stereo network that triangulates depth from the known-pose "
+                                       "turntable neighbours (metric, no scale ambiguity). Requires "
+                                       "--use_known_pose and frame_ids listing the source offsets."),
+                                 action="store_true")
+        self.parser.add_argument("--mvs_frame_offsets",
+                                 nargs="+", type=int,
+                                 help=("turntable frame offsets used as MVS source views. If empty, the "
+                                       "non-zero entries of --frame_ids are used."),
+                                 default=[])
+        self.parser.add_argument("--mvs_num_depth_coarse",
+                                 type=int,
+                                 help="number of uniform depth planes in the coarse MVS sweep",
+                                 default=48)
+        self.parser.add_argument("--mvs_num_depth_fine",
+                                 type=int,
+                                 help="number of per-pixel depth planes in the fine MVS sweep",
+                                 default=48)
+        self.parser.add_argument("--mvs_fine_range_mm",
+                                 type=float,
+                                 help="half-width (mm) of the fine sweep window around the coarse depth",
+                                 default=20.0)
+        self.parser.add_argument("--mvs_feature_ch",
+                                 type=int,
+                                 help="output channels of the shared MVS feature extractor",
+                                 default=32)
+        self.parser.add_argument("--mvs_num_groups",
+                                 type=int,
+                                 help="group-wise correlation groups for the MVS cost volume (must divide mvs_feature_ch)",
+                                 default=8)
+        self.parser.add_argument("--mvs_feat_scale",
+                                 type=int,
+                                 help="downsample factor of the MVS feature map / cost volume (2, 4 or 8)",
+                                 default=8)
+        self.parser.add_argument("--frames_per_seq",
+                                 type=int,
+                                 help="number of frames per turntable sequence (for cyclic neighbour indexing)",
+                                 default=120)
         self.parser.add_argument("--use_gt_depth",
                                  help="if set, supervises training with GT metric depth maps",
                                  action="store_true")
