@@ -50,7 +50,8 @@ class StoneDataset(MonoDatasetMultiCam):
                  gt_depth_subdir="data_depth_annotated/train/groundtruth",
                  gt_depth_encoding="auto", gt_depth_scale=100000.0,
                  use_strong_aug=False, use_crop_aug=False, use_scale_aug=False,
-                 scale_aug_max=1.15, scale_aug_prob=0.5, **kwargs):
+                 scale_aug_max=1.15, scale_aug_prob=0.5,
+                 cyclic_frames=False, frames_per_seq=120, **kwargs):
         # `*args` / `**kwargs` are forwarded to the base class. For StoneDataset, the
         # base constructor comes from MonoDatasetMultiCam and typically includes:
         #   (intrinsics_file_path, data_path, filenames, height, width, frame_idxs, num_scales, ...)
@@ -74,6 +75,12 @@ class StoneDataset(MonoDatasetMultiCam):
         self.use_scale_aug = use_scale_aug
         self.scale_aug_max = float(scale_aug_max)
         self.scale_aug_prob = float(scale_aug_prob)
+        # Turntable is a closed 360 deg loop, so wide MVS source offsets (e.g. -8/+8)
+        # can index past frame 1 or the last frame. When cyclic_frames is on, source
+        # frame indices wrap modulo frames_per_seq so any offset always resolves to a
+        # real file. Only source colours are wrapped (target/mask/GT stay in range).
+        self.cyclic_frames = bool(cyclic_frames)
+        self.frames_per_seq = int(frames_per_seq)
         self.interp_mask = Image.NEAREST  # keep masks discrete (no interpolation blending)
         self.mask_resize = {}  # per-scale resize transforms for masks
 
@@ -289,6 +296,13 @@ class StoneDataset(MonoDatasetMultiCam):
         if self.use_mask and (("mask", 0, -1) in inputs):
             del inputs[("mask", 0, -1)]  # remove native-resolution mask PIL entry
 
+        # Optional per-folder metric turntable-axis distance (6th intrinsics column).
+        # Exposed as a scalar tensor so the known-pose warp / MVS can use the true
+        # absolute scale instead of a GT-median estimate.
+        axis_map = getattr(self, "axis_depth_map", None)
+        if axis_map and folder in axis_map:
+            inputs["axis_depth"] = torch.tensor(float(axis_map[folder]), dtype=torch.float32)
+
         # Load GT metric depth for the target frame (after preprocess, so not part of image pyramid).
         # Stored as a float32 tensor [1, H, W] in metres; used by the trainer for supervised loss.
         if self.use_gt_depth and self.gt_depth_path is not None:
@@ -303,6 +317,9 @@ class StoneDataset(MonoDatasetMultiCam):
         stone_syn_dataset naming: images are stored directly in the folder root
         as 4-digit zero-padded files, e.g. stone_01/0001.png.
         """
+        if self.cyclic_frames and self.frames_per_seq > 0:
+            # Map into [1, frames_per_seq] on the closed turntable loop.
+            frame_index = ((frame_index - 1) % self.frames_per_seq) + 1
         fname = f"{frame_index:04d}.png"  # e.g. 0001.png, 0042.png
         image_path = os.path.join(self.data_path, folder, fname)
         color = pil_loader(image_path)  # load RGB image via shared loader
@@ -396,13 +413,17 @@ class StoneDataset(MonoDatasetMultiCam):
         """Parse a KV intrinsics file into a dict.
 
         File format (one line per folder):
-            <folder> <fx_norm> <fy_norm> <cx_norm> <cy_norm>
+            <folder> <fx_norm> <fy_norm> <cx_norm> <cy_norm> [axis_depth_m]
 
         Values are *normalized* by image width/height, so they are resolution-independent.
-        We convert them into a 3x4 matrix format used throughout the project.
+        We convert them into a 3x4 matrix format used throughout the project. An
+        optional 6th column gives the per-folder metric camera-to-turntable-axis
+        distance in metres, used by the known-pose warp / MVS for correct absolute
+        scale. When absent, the trainer falls back to a GT-median estimate.
         """
         lines = self._read_lines(file_name)  # read all lines from file
         KV_intrinsics_dict = {}  # folder -> K (3x4)
+        self.axis_depth_map = {}  # folder -> metric axis depth (metres), optional
         for line in lines:  # iterate each line
             parts = line.strip().split()  # split by whitespace
             if len(parts) < 5:  # skip malformed/empty/comment lines
@@ -415,6 +436,11 @@ class StoneDataset(MonoDatasetMultiCam):
             KV_intrinsics_dict[folder_key] = np.array(  # create K in a 3x4 "projection" style matrix
                 [[fx, 0, cx, 0], [0, fy, cy, 0], [0, 0, 1, 0]], dtype=np.float32
             )
+            if len(parts) >= 6:
+                try:
+                    self.axis_depth_map[folder_key] = float(parts[5])
+                except ValueError:
+                    pass
         return KV_intrinsics_dict  # mapping used by get_intrinsics()
 
     @staticmethod
