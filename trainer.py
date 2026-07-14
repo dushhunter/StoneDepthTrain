@@ -808,6 +808,16 @@ class Trainer:
                     "epoch/stone_relief_rmse_mm", s_relief_rmse_mm, self.epoch)
                 mlflow_metrics["stone_relief_rmse_mm"] = s_relief_rmse_mm
 
+        # Select the best model on the ANCHORED (median-scaled) stone RMSE. The raw
+        # stone RMSE is dominated by the un-fixable per-stone absolute-scale guess, so
+        # choosing on it picks noisy epochs; the median-scaled value matches the accuracy
+        # obtained after plane/scale anchoring at deployment. Kept in metres to stay
+        # consistent with best_val_metric (which is logged as metres and mm).
+        if s_rmse_medscaled_mm is not None:
+            selection_metric = s_rmse_medscaled_mm / 1000.0
+            print("    -> model selection metric (anchored median-scaled): "
+                  "{:.3f}mm".format(s_rmse_medscaled_mm))
+
         self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
 
         # Persist per-epoch validation metrics to a CSV for offline inspection.
