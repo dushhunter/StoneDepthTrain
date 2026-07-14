@@ -19,6 +19,60 @@ from torchvision import transforms, datasets
 from SQLdepth import MonodepthOptions, SQLdepth
 STEREO_SCALE_FACTOR = 5.4
 
+
+def _load_bg_mask(mask_dir, name, height, width):
+    """Load a background mask (1 = background/flat surface, 0 = stone) or None.
+
+    Stone masks follow the training convention (foreground stone > 127). Files may
+    be named mask_<name>.<ext> or <name>.<ext>.
+    """
+    if not mask_dir:
+        return None
+    for cand in ("mask_{}.png".format(name), "{}.png".format(name),
+                 "mask_{}.jpg".format(name), "{}.jpg".format(name)):
+        p = os.path.join(mask_dir, cand)
+        if os.path.isfile(p):
+            m = pil.open(p).convert("L").resize((width, height), pil.NEAREST)
+            return (np.array(m) <= 127).astype(np.float32)  # background = not stone
+    return None
+
+
+def _fit_background_plane(depth, bg_mask=None, iters=5, k=2.5, min_pixels=200):
+    """Robustly fit a plane z = a*u + b*v + c to the flat background of a depth map.
+
+    The flat surface dominates the image, so an iteratively reweighted least-squares
+    fit (dropping >k MAD residuals each round) converges to the background plane and
+    rejects the small stone bump even when no mask is supplied. Returns the full-frame
+    plane depth [H, W] (float32) or None if the fit is not possible.
+    """
+    h, w = depth.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    u = (xs / max(w - 1, 1)).astype(np.float64).ravel()
+    v = (ys / max(h - 1, 1)).astype(np.float64).ravel()
+    z = depth.astype(np.float64).ravel()
+    valid = np.isfinite(z) & (z > 1e-6)
+    if bg_mask is not None:
+        valid &= (bg_mask.ravel() > 0.5)
+    idx = np.where(valid)[0]
+    if idx.size < min_pixels:
+        return None
+    A = np.stack([u, v, np.ones_like(u)], axis=1)
+    sel = idx
+    coeff = None
+    for _ in range(iters):
+        coeff, *_ = np.linalg.lstsq(A[sel], z[sel], rcond=None)
+        resid = z[idx] - A[idx] @ coeff
+        med = np.median(resid)
+        mad = np.median(np.abs(resid - med)) + 1e-9
+        inl = np.abs(resid - med) < k * 1.4826 * mad
+        new_sel = idx[inl]
+        if new_sel.size < min_pixels or new_sel.size == sel.size:
+            break
+        sel = new_sel
+    if coeff is None:
+        return None
+    return (A @ coeff).reshape(h, w).astype(np.float32)
+
 def test_simple(args):
     """Function to predict for a single image or folder of images
     """
@@ -96,6 +150,34 @@ def test_simple(args):
 
             # Saving colormapped depth image
             disp_resized_np = disp_resized.squeeze().cpu().numpy()
+
+            # --- Anchor absolute scale to the background plane -------------------
+            # The network cannot infer an unseen stone's absolute distance from one
+            # image, so its raw depth is off by a per-scene global scale/offset. Fit
+            # the flat surface and either (a) rescale so the plane matches the rig's
+            # known camera-to-surface distance (absolute metric), or (b) subtract the
+            # plane to output stone relief (up-to-plane, no reference needed).
+            bg_mask = _load_bg_mask(
+                args.stone_mask_path, output_name, original_height, original_width)
+            plane = _fit_background_plane(disp_resized_np, bg_mask)
+            if plane is not None:
+                cy, cx = original_height // 2, original_width // 2
+                if args.ref_plane_depth > 0:
+                    denom = float(plane[cy, cx])
+                    if abs(denom) < 1e-6:
+                        denom = float(np.median(plane))
+                    scale = args.ref_plane_depth / denom
+                    disp_resized_np = (disp_resized_np * scale).astype(np.float32)
+                    print("   anchored (absolute): plane_center={:.4f}m -> ref={:.4f}m "
+                          "(scale={:.4f})".format(denom, args.ref_plane_depth, scale))
+                else:
+                    # Height above the plane; +ve = protruding toward the camera.
+                    disp_resized_np = (plane - disp_resized_np).astype(np.float32)
+                    print("   anchored (relief): output is plane-relative height in m")
+            else:
+                print("   anchoring skipped (background plane fit failed)")
+            # ---------------------------------------------------------------------
+
             vmax = np.percentile(disp_resized_np, 95)
 
             # Saving uint16 depth map
@@ -103,7 +185,9 @@ def test_simple(args):
             if not os.path.exists(to_save_dir):
                 os.makedirs(to_save_dir)
             to_save_path = os.path.join(to_save_dir, "{}.png".format(output_name))
-            to_save = (disp_resized_np * 1000).astype('uint16')
+            # Clip negatives so relief-mode output (plane - depth) does not wrap uint16;
+            # the float32 .npy below keeps the true signed values.
+            to_save = (np.clip(disp_resized_np, 0, None) * 1000).astype('uint16')
             pil.fromarray(to_save).save(to_save_path)
 
             # Saving float32 NPY depth map (metric metres, for downstream 3D reconstruction)
