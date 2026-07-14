@@ -1,0 +1,49 @@
+--data_path /home/dilan/msc_research/StoneVolMain/stone_syn_dataset
+--dataset stone
+--split stone
+--intrinsics_file_path /home/dilan/msc_research/StoneVolMain/splits/stone/intrinsics.txt
+--height 576
+--width 1024
+--batch_size 1
+--accumulation_steps 8
+--num_epochs 30
+--frame_ids 0 -8 -4 4 8
+--min_depth 0.30
+--max_depth 1.00
+--learning_rate 1e-4
+--model_dim 32
+--query_nums 64
+--patch_size 16
+--dim_out 256
+--decoder_norm group
+--backbone resnet18_lite
+--weight_decay 1e-2
+--log_dir stone_weights
+--model_name my_stone_experiment_mvs_v1
+--use_known_pose
+--turntable_angle_deg 3.0
+--use_mvs
+--mvs_num_depth_coarse 48
+--mvs_num_depth_fine 48
+--mvs_fine_range_mm 20.0
+--mvs_feature_ch 32
+--mvs_num_groups 8
+--mvs_feat_scale 8
+--frames_per_seq 120
+--use_gt_depth
+--gt_depth_path /home/dilan/msc_research/StoneVolMain/stone_syn_dataset
+--gt_depth_subdir data_depth_annotated/train/groundtruth_float32png
+--gt_depth_encoding float32_rgba
+--gt_depth_weight 1.0
+--use_berhu_loss
+--gt_silog_weight 0.0
+--gt_grad_weight 1.0
+--gt_normal_weight 0.2
+--use_mask
+--stone_loss_weight 2.0
+--boundary_loss_weight 3.0
+--disable_automasking
+--mlflow
+--mlflow_tracking_uri file:./mlruns
+--mlflow_experiment_name StoneVolMain-train-mvs
+--mlflow_tags pipeline=train,dataset=stone,head=mvs
