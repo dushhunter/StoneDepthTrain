@@ -54,6 +54,10 @@ class Trainer:
         self.models = {}
         self.parameters_to_train = []
 
+        # Cost-volume MVS mode: triangulate metric depth from known-pose neighbours
+        # instead of the monocular head. See networks/mvs_*.py.
+        self.use_mvs = getattr(self.opt, "use_mvs", False)
+
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
         self.num_scales = len(self.opt.scales) # default=[0], we only perform single scale training
@@ -162,6 +166,42 @@ class Trainer:
         #     self.models["predictive_mask"].to(self.device)
         #     self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
+        # Cost-volume MVS head. When enabled, the shared feature extractor + cascade
+        # plane-sweep network replace the monocular encoder/depth head as the only
+        # trained parameters (the monocular nets stay built for API compatibility but
+        # are frozen and unused). Requires --use_known_pose for the metric transforms.
+        if self.use_mvs:
+            assert self.opt.use_known_pose, "--use_mvs requires --use_known_pose (metric turntable transforms)"
+            feat_ch = getattr(self.opt, "mvs_feature_ch", 32)
+            feat_scale = getattr(self.opt, "mvs_feat_scale", 8)
+            self.models["mvs_feature"] = networks.MVSFeatureNet(
+                out_ch=feat_ch, feat_scale=feat_scale).cuda()
+            self.models["mvs"] = networks.PlaneSweepMVS(
+                feat_ch=feat_ch,
+                num_groups=getattr(self.opt, "mvs_num_groups", 8),
+                feat_scale=feat_scale,
+                min_depth=self.opt.min_depth, max_depth=self.opt.max_depth,
+                ndepth_coarse=getattr(self.opt, "mvs_num_depth_coarse", 48),
+                ndepth_fine=getattr(self.opt, "mvs_num_depth_fine", 48),
+                fine_range_mm=getattr(self.opt, "mvs_fine_range_mm", 20.0)).cuda()
+            self.models["mvs_feature"] = torch.nn.DataParallel(self.models["mvs_feature"])
+            self.models["mvs"] = torch.nn.DataParallel(self.models["mvs"])
+
+            # Freeze the (unused) monocular nets and train only the MVS parameters.
+            for name in ("encoder", "depth", "pose", "refine"):
+                if name in self.models:
+                    for p in self.models[name].parameters():
+                        p.requires_grad_(False)
+            self.parameters_to_train = list(self.models["mvs_feature"].parameters()) \
+                + list(self.models["mvs"].parameters())
+
+            # MVS source views for training = the non-zero frame_ids the dataset loads.
+            # (--mvs_frame_offsets is honoured by the standalone inference script; here
+            # frame_ids is authoritative so the required colours are actually present.)
+            offs = [f for f in self.opt.frame_ids if f != 0 and f != "s"]
+            assert len(offs) >= 1, "MVS needs frame_ids with >=1 non-zero source offset"
+            self.mvs_offsets = offs
+
         weight_decay = getattr(self.opt, "weight_decay", 0.0)
         if self.opt.diff_lr :
             df_params = [{"params": self.pose_params, "lr": self.opt.learning_rate / 10},
@@ -210,7 +250,9 @@ class Trainer:
                 use_crop_aug=getattr(self.opt, "use_crop_aug", False),
                 use_scale_aug=getattr(self.opt, "use_scale_aug", False),
                 scale_aug_max=getattr(self.opt, "scale_aug_max", 1.15),
-                scale_aug_prob=getattr(self.opt, "scale_aug_prob", 0.5))
+                scale_aug_prob=getattr(self.opt, "scale_aug_prob", 0.5),
+                cyclic_frames=getattr(self.opt, "use_mvs", False),
+                frames_per_seq=getattr(self.opt, "frames_per_seq", 120))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             train_dataset = self.dataset(
             self.opt.intrinsics_file_path, self.opt.data_path, train_filenames,  # StoneVol_main: pass intrinsics file first
@@ -232,7 +274,9 @@ class Trainer:
                 gt_depth_path=self.opt.gt_depth_path if self.opt.gt_depth_path else self.opt.data_path,
                 gt_depth_subdir=self.opt.gt_depth_subdir,
                 gt_depth_encoding=self.opt.gt_depth_encoding,
-                gt_depth_scale=self.opt.gt_depth_scale)
+                gt_depth_scale=self.opt.gt_depth_scale,
+                cyclic_frames=getattr(self.opt, "use_mvs", False),
+                frames_per_seq=getattr(self.opt, "frames_per_seq", 120))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             val_dataset = self.dataset(
             self.opt.intrinsics_file_path, self.opt.data_path, val_filenames,  # StoneVol_main: pass intrinsics file first
@@ -283,6 +327,14 @@ class Trainer:
         """
         if getattr(self.opt, "turntable_axis_depth", -1.0) > 0:
             return float(self.opt.turntable_axis_depth)
+        # Prefer the true per-folder metric axis distance if the dataset supplied it
+        # (optional 6th column of the intrinsics file). This gives correct absolute
+        # scale for the MVS plane sweep without relying on GT at deployment.
+        if "axis_depth" in inputs:
+            try:
+                return float(inputs["axis_depth"].float().mean().item())
+            except Exception:
+                pass
         if "depth_gt" in inputs:
             d = inputs["depth_gt"]
             valid = (d > self.opt.min_depth) & (d < self.opt.max_depth)
@@ -457,6 +509,11 @@ class Trainer:
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
 
+        if self.use_mvs:
+            outputs = self.run_mvs(inputs)
+            losses = self.compute_losses(inputs, outputs)
+            return outputs, losses
+
         if self.opt.pose_model_type == "shared": # default no
             # If we are using a shared encoder for both depth and pose (as advocated
             # in monodepthv1), then all images are fed separately through the depth encoder.
@@ -491,6 +548,42 @@ class Trainer:
         losses = self.compute_losses(inputs, outputs)
 
         return outputs, losses
+
+    def run_mvs(self, inputs):
+        """Cost-volume MVS forward pass -> metric depth in the reference frame.
+
+        Builds shared features for the reference view (frame 0) and every source
+        view, obtains the known metric cam_T_cam(0->src) transforms, runs the
+        cascade plane sweep, and writes full-resolution metric depth into the
+        standard output keys so the existing GT losses / validation work unchanged.
+        """
+        # Use the un-augmented colour for cross-view matching (colour jitter would
+        # break photo-consistency between the reference and source features).
+        ref = inputs[("color", 0, 0)]
+        feat_ref = self.models["mvs_feature"](ref)
+        feat_srcs, Ts = [], []
+
+        pose_out = self.predict_poses(inputs, None)  # known-pose branch, metric transforms
+        for f in self.mvs_offsets:
+            feat_srcs.append(self.models["mvs_feature"](inputs[("color", f, 0)]))
+            Ts.append(pose_out[("cam_T_cam", 0, f)])
+
+        K3x3 = inputs[("K3x3", 0)].float()  # [B, 3, 3] full-res intrinsics
+        mvs_out = self.models["mvs"](feat_ref, feat_srcs, Ts, K3x3)
+
+        H, W = ref.shape[-2:]
+        depth = F.interpolate(mvs_out["depth"], size=(H, W),
+                              mode="bilinear", align_corners=False)
+        depth_coarse = F.interpolate(mvs_out["depth_coarse"], size=(H, W),
+                                     mode="bilinear", align_corners=False)
+
+        outputs = {}
+        # Both keys hold the metric depth (MVS predicts depth directly, not disparity),
+        # so the GT loss (reads ("depth",0,0)) and validation (reads ("disp",0)) agree.
+        outputs[("disp", 0)] = depth
+        outputs[("depth", 0, 0)] = depth
+        outputs[("mvs_coarse", 0)] = depth_coarse
+        return outputs
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -623,6 +716,33 @@ class Trainer:
             sol = torch.linalg.pinv(ata) @ (A_bg.t() @ z_bg)
         return (A @ sol).reshape(H, W)
 
+    def _ms_scale(self, s_median):
+        """Scale to use for the median-scaled ('ms') metric variant.
+
+        Uses a fixed --pred_depth_scale_factor when the user set one (!=1), else the
+        per-image median ratio gt/pred (the standard self-supervised monocular protocol).
+        """
+        pf = getattr(self.opt, "pred_depth_scale_factor", 1.0)
+        if pf and pf != 1.0:
+            return float(pf)
+        return float(s_median)
+
+    def _depth_metric_suite(self, pred_b, gt_b, region_mask, scale, min_pixels=64):
+        """Return the 7 SPIdepth/KITTI metrics on a region, after applying `scale`.
+
+        pred_b, gt_b: [H, W] depth maps. region_mask: [H, W] bool. Returns a length-7
+        numpy array [abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3] or None if too few
+        pixels. Prediction is clamped to the configured depth range so log/ratio terms
+        stay finite.
+        """
+        if region_mask.sum().item() < min_pixels:
+            return None
+        gt_sel = gt_b[region_mask]
+        pred_sel = (pred_b[region_mask] * float(scale)).clamp(
+            self.opt.min_depth, self.opt.max_depth)
+        errs = compute_depth_errors(gt_sel, pred_sel)
+        return np.array([float(e.item()) for e in errs], dtype=np.float64)
+
     def validate_full_epoch(self):
         """Run validation over the entire val set.
 
@@ -654,17 +774,26 @@ class Trainer:
         sms_n = 0.0
         relief_se_sum = 0.0
         relief_n = 0.0
+        # SPIdepth-style 7-metric suite, averaged per image, for four variants:
+        #   img_ms / img_abs     : whole valid image, median-scaled / absolute
+        #   stone_ms / stone_abs : stone region,     median-scaled / absolute
+        suite_variants = ("img_ms", "img_abs", "stone_ms", "stone_abs")
+        suite_sum = {k: np.zeros(7, dtype=np.float64) for k in suite_variants}
+        suite_cnt = {k: 0 for k in suite_variants}
 
         with torch.no_grad():
             for inputs in self.val_loader:
                 for key, ipt in inputs.items():
                     inputs[key] = ipt.to(self.device)
 
-                features = self.models["encoder"](inputs["color_aug", 0, 0])
-                outputs = self.models["depth"](features)
-                if "refine" in self.models:
-                    outputs[("disp", 0)] = self.models["refine"](
-                        outputs[("disp", 0)], inputs[("color", 0, 0)])
+                if self.use_mvs:
+                    outputs = self.run_mvs(inputs)
+                else:
+                    features = self.models["encoder"](inputs["color_aug", 0, 0])
+                    outputs = self.models["depth"](features)
+                    if "refine" in self.models:
+                        outputs[("disp", 0)] = self.models["refine"](
+                            outputs[("disp", 0)], inputs[("color", 0, 0)])
 
                 if "depth_gt" not in inputs:
                     self.set_train()
@@ -694,6 +823,26 @@ class Trainer:
                 g_abs_rel_sum += (torch.abs(err_v) / gt_v).sum().item()
                 g_se_sum += (err_v ** 2).sum().item()
                 g_n += float(valid.sum().item())
+
+                # SPIdepth-style 7-metric suite on the whole valid image (per image).
+                for b in range(depth_gt.shape[0]):
+                    gt_b = depth_gt[b, 0]
+                    pred_b = depth_pred[b, 0]
+                    valid_b = valid[b, 0]
+                    if valid_b.sum().item() == 0:
+                        continue
+                    s_img = (torch.median(gt_b[valid_b]) /
+                             torch.median(pred_b[valid_b]).clamp(min=1e-6)).item()
+                    m_abs = self._depth_metric_suite(pred_b, gt_b, valid_b, 1.0)
+                    if m_abs is not None:
+                        suite_sum["img_abs"] += m_abs
+                        suite_cnt["img_abs"] += 1
+                    if not self.opt.disable_median_scaling:
+                        m_ms = self._depth_metric_suite(
+                            pred_b, gt_b, valid_b, self._ms_scale(s_img))
+                        if m_ms is not None:
+                            suite_sum["img_ms"] += m_ms
+                            suite_cnt["img_ms"] += 1
 
                 # Stone-region metrics restricted to the foreground mask.
                 if ("mask", 0, 0) in inputs:
@@ -729,6 +878,18 @@ class Trainer:
                         pred_sb_scaled = pred_b[stone_b] * scale
                         sms_se_sum += ((pred_sb_scaled - gt_sb) ** 2).sum().item()
                         sms_n += float(stone_b.sum().item())
+
+                        # SPIdepth-style 7-metric suite on the stone region.
+                        m_sabs = self._depth_metric_suite(pred_b, gt_b, stone_b, 1.0)
+                        if m_sabs is not None:
+                            suite_sum["stone_abs"] += m_sabs
+                            suite_cnt["stone_abs"] += 1
+                        if not self.opt.disable_median_scaling:
+                            m_sms = self._depth_metric_suite(
+                                pred_b, gt_b, stone_b, self._ms_scale(scale.item()))
+                            if m_sms is not None:
+                                suite_sum["stone_ms"] += m_sms
+                                suite_cnt["stone_ms"] += 1
 
                         # (2) Plane-relative: subtract each map's own background plane,
                         # then compare stone height-above-plane (scale+pose invariant).
@@ -818,6 +979,17 @@ class Trainer:
             print("    -> model selection metric (anchored median-scaled): "
                   "{:.3f}mm".format(s_rmse_medscaled_mm))
 
+        # SPIdepth-style 7-metric suite (per-image mean), four variants.
+        suite_avg = {k: (suite_sum[k] / suite_cnt[k]) if suite_cnt[k] > 0 else None
+                     for k in suite_variants}
+        self._print_depth_metric_table(suite_avg)
+        self._append_depth_metrics_csv(suite_avg)
+        metric7 = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
+        for variant, vals in suite_avg.items():
+            if vals is not None:
+                for name, v in zip(metric7, vals):
+                    mlflow_metrics["{}_{}".format(variant, name)] = float(v)
+
         self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
 
         # Persist per-epoch validation metrics to a CSV for offline inspection.
@@ -826,6 +998,49 @@ class Trainer:
             s_rmse_medscaled_mm, s_relief_rmse_mm)
 
         return selection_metric
+
+    def _print_depth_metric_table(self, suite_avg):
+        """Print the four-variant 7-metric suite as a compact SPIdepth-style table."""
+        labels = [
+            ("img_ms", "img  (scaled)"),
+            ("img_abs", "img  (abs)   "),
+            ("stone_ms", "stone(scaled)"),
+            ("stone_abs", "stone(abs)   "),
+        ]
+        print("  Epoch {} depth metrics (per-image mean; 'scaled' = median-scaled, "
+              "SPIdepth protocol):".format(self.epoch))
+        print("                 AbsRel   SqRel    RMSE     RMSElog  d1      d2      d3")
+        for key, label in labels:
+            vals = suite_avg.get(key)
+            if vals is None:
+                continue
+            ar, sr, rm, rl, a1, a2, a3 = vals
+            note = "  <- compare to SPIdepth" if key == "img_ms" else ""
+            print("   {}  {:.4f}   {:.4f}   {:.4f}   {:.4f}   {:.4f}  {:.4f}  {:.4f}{}".format(
+                label, ar, sr, rm, rl, a1, a2, a3, note))
+
+    def _append_depth_metrics_csv(self, suite_avg):
+        """Append the four-variant 7-metric suite for this epoch to depth_metrics.csv."""
+        csv_path = os.path.join(self.log_path, "depth_metrics.csv")
+        metric7 = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
+        header = ["epoch"]
+        for variant in ("img_ms", "img_abs", "stone_ms", "stone_abs"):
+            header += ["{}_{}".format(variant, m) for m in metric7]
+
+        row = [str(self.epoch)]
+        for variant in ("img_ms", "img_abs", "stone_ms", "stone_abs"):
+            vals = suite_avg.get(variant)
+            if vals is None:
+                row += [""] * 7
+            else:
+                row += ["{:.6f}".format(float(v)) for v in vals]
+
+        write_header = not os.path.isfile(csv_path)
+        with open(csv_path, "a") as f:
+            if write_header:
+                f.write(",".join(header) + "\n")
+            f.write(",".join(row) + "\n")
+        print("  -> depth metrics appended to {}".format(csv_path))
 
     def _append_val_metrics_csv(self, g_abs_rel, g_rmse,
                                 s_abs_rel, s_rmse, d1, d2, d5,
@@ -1229,6 +1444,19 @@ class Trainer:
                 losses["loss/gt_silog"] = gt_log
                 total_loss += self.opt.gt_depth_weight * gt_loss
 
+                # Deep supervision for the coarse MVS stage: a light weighted-L1 on
+                # the coarse depth keeps the cascade's first estimate close to GT so
+                # the fine sweep window (+/- fine_range_mm) actually brackets the true
+                # surface. Uses the same per-pixel weight map as the primary loss.
+                if ("mvs_coarse", 0) in outputs:
+                    coarse = outputs[("mvs_coarse", 0)]
+                    if coarse.shape[-2:] != depth_gt.shape[-2:]:
+                        coarse = F.interpolate(coarse, depth_gt.shape[-2:],
+                                               mode="bilinear", align_corners=False)
+                    coarse_l1 = (w_valid * torch.abs(coarse - depth_gt)).sum() / denom
+                    losses["loss/mvs_coarse"] = coarse_l1
+                    total_loss += 0.5 * self.opt.gt_depth_weight * coarse_l1
+
                 # Depth-gradient loss: force the model to match surface slopes,
                 # not just absolute depth values. This captures curvature/detail and,
                 # crucially, the sharp depth cliff at the stone silhouette.
@@ -1385,7 +1613,7 @@ class Trainer:
                     writer.add_image(
                         "color_{}_{}/{}".format(frame_id, s, j),
                         inputs[("color", frame_id, s)][j].data, self.step)
-                    if s == 0 and frame_id != 0:
+                    if s == 0 and frame_id != 0 and (("color", frame_id, s) in outputs):
                         writer.add_image(
                             "color_pred_{}_{}/{}".format(frame_id, s, j),
                             outputs[("color", frame_id, s)][j].data, self.step)
@@ -1401,7 +1629,8 @@ class Trainer:
                             outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
                             self.step)
 
-                elif not self.opt.disable_automasking:
+                elif not self.opt.disable_automasking and \
+                        ("identity_selection/{}".format(s) in outputs):
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
