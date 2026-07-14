@@ -621,6 +621,20 @@ class MonodepthOptions:
                                 help='path to a test image or folder of images')
         self.parser.add_argument('--ext', type=str,
                                 help='image extension to search for in folder', default="png")
+        self.parser.add_argument("--ref_plane_depth",
+                                 type=float,
+                                 help=("camera-to-flat-surface distance in metres, measured once for the rig. "
+                                       "If >0, the predicted depth is rescaled so its fitted background plane "
+                                       "sits at this depth (recovers absolute metric scale). If <=0, the "
+                                       "background plane is subtracted instead, giving plane-relative relief "
+                                       "(up-to-plane, no absolute reference needed)."),
+                                 default=-1.0)
+        self.parser.add_argument("--stone_mask_path",
+                                 type=str,
+                                 help=("optional path to a folder of foreground stone masks (named like the "
+                                       "input images, e.g. mask_0001.png or 0001.png). When present, mask pixels "
+                                       "are excluded from the background-plane fit for a cleaner anchor."),
+                                 default="")
 
 
     def parse(self):
