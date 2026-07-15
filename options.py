@@ -260,6 +260,20 @@ class MonodepthOptions:
                                  type=float,
                                  help="weight for surface-normal loss (angular surface matching)",
                                  default=0.0)
+        self.parser.add_argument("--gt_relief_weight",
+                                 type=float,
+                                 help=("weight for the plane-relative relief loss: fits a plane to the "
+                                       "background of GT and prediction, subtracts it, and matches the "
+                                       "residual height over the stone. Scale/pose-invariant shape term."),
+                                 default=0.0)
+        self.parser.add_argument("--gt_curvature_weight",
+                                 type=float,
+                                 help="weight for the curvature (Laplacian) loss matching 2nd-order surface detail",
+                                 default=0.0)
+        self.parser.add_argument("--select_on_medscaled",
+                                 help=("select weights_best on median-scaled stone RMSE (anchored-at-deploy "
+                                       "protocol). Default selects on absolute stone RMSE (metric-on-its-own)."),
+                                 action="store_true")
         self.parser.add_argument("--stone_loss_weight",
                                  type=float,
                                  help=("extra weight applied to foreground (stone) pixels in the GT depth "
