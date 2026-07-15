@@ -969,15 +969,18 @@ class Trainer:
                     "epoch/stone_relief_rmse_mm", s_relief_rmse_mm, self.epoch)
                 mlflow_metrics["stone_relief_rmse_mm"] = s_relief_rmse_mm
 
-        # Select the best model on the ANCHORED (median-scaled) stone RMSE. The raw
-        # stone RMSE is dominated by the un-fixable per-stone absolute-scale guess, so
-        # choosing on it picks noisy epochs; the median-scaled value matches the accuracy
-        # obtained after plane/scale anchoring at deployment. Kept in metres to stay
-        # consistent with best_val_metric (which is logged as metres and mm).
-        if s_rmse_medscaled_mm is not None:
+        # Model selection. By default we select on the ABSOLUTE stone RMSE (metres),
+        # because the goal is a metric-on-its-own model (no test-time anchoring) - the
+        # raw stone RMSE is exactly what deployment sees. Pass --select_on_medscaled to
+        # instead select on the median-scaled stone RMSE (matches an anchored-at-
+        # deployment protocol), which is the previous behaviour.
+        if getattr(self.opt, "select_on_medscaled", False) and s_rmse_medscaled_mm is not None:
             selection_metric = s_rmse_medscaled_mm / 1000.0
             print("    -> model selection metric (anchored median-scaled): "
                   "{:.3f}mm".format(s_rmse_medscaled_mm))
+        elif selection_metric is not None:
+            print("    -> model selection metric (absolute stone RMSE): "
+                  "{:.3f}mm".format(selection_metric * 1000.0))
 
         # SPIdepth-style 7-metric suite (per-image mean), four variants.
         suite_avg = {k: (suite_sum[k] / suite_cnt[k]) if suite_cnt[k] > 0 else None
@@ -1508,6 +1511,51 @@ class Trainer:
                         normal_loss = normal_loss.sum() / valid_n.sum().clamp(min=1)
                         losses["loss/gt_normal"] = normal_loss
                         total_loss += normal_weight * normal_loss
+
+                # Plane-relative relief loss: isolate the few-mm stone relief from the
+                # dominant (and easy) background plane. Fit a plane to GT and to the
+                # prediction over the background, subtract it from each, and match the
+                # residual height over the stone. This is invariant to the absolute
+                # scale and the plane's pose, so it supervises the stone's *shape*
+                # directly, on top of the absolute BerHu term.
+                relief_weight = getattr(self.opt, 'gt_relief_weight', 0.0)
+                if relief_weight > 0 and fg is not None:
+                    relief_terms = []
+                    for b in range(depth_gt.shape[0]):
+                        vb = valid[b, 0]
+                        fgb = fg[b, 0] > 0.5
+                        bg_b = vb & (~fgb)   # background = valid, non-stone
+                        st_b = vb & fgb      # stone region
+                        if st_b.sum() < 16:
+                            continue
+                        plane_gt = self._fit_plane(depth_gt[b, 0], bg_b)
+                        plane_pr = self._fit_plane(depth_pred_gt[b, 0], bg_b)
+                        if plane_gt is None or plane_pr is None:
+                            continue
+                        relief_gt = depth_gt[b, 0] - plane_gt
+                        relief_pr = depth_pred_gt[b, 0] - plane_pr
+                        relief_terms.append(torch.abs(relief_pr - relief_gt)[st_b].mean())
+                    if relief_terms:
+                        relief_loss = torch.stack(relief_terms).mean()
+                        losses["loss/gt_relief"] = relief_loss
+                        total_loss += relief_weight * relief_loss
+
+                # Curvature (Laplacian) loss: match the second-order surface variation
+                # so fine stone detail/facets are reproduced, not just first-order
+                # slopes. Weighted by the same stone/boundary map over the valid interior.
+                curv_weight = getattr(self.opt, 'gt_curvature_weight', 0.0)
+                if curv_weight > 0:
+                    def _laplacian(d):
+                        return (d[:, :, 2:, 1:-1] + d[:, :, :-2, 1:-1]
+                                + d[:, :, 1:-1, 2:] + d[:, :, 1:-1, :-2]
+                                - 4.0 * d[:, :, 1:-1, 1:-1])
+                    pred_lap = _laplacian(depth_pred_gt)
+                    gt_lap = _laplacian(depth_gt)
+                    w_in = (weight[:, :, 1:-1, 1:-1] * valid[:, :, 1:-1, 1:-1].float())
+                    if w_in.sum() > 0:
+                        curv_loss = (w_in * torch.abs(pred_lap - gt_lap)).sum() / w_in.sum().clamp(min=1.0)
+                        losses["loss/gt_curvature"] = curv_loss
+                        total_loss += curv_weight * curv_loss
 
         # ENHANCEMENT #2: Depth smoothness regularization (edge-aware)
         # Encourages smooth depth predictions away from image edges
