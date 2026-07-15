@@ -157,9 +157,17 @@ def test_simple(args):
             # the flat surface and either (a) rescale so the plane matches the rig's
             # known camera-to-surface distance (absolute metric), or (b) subtract the
             # plane to output stone relief (up-to-plane, no reference needed).
-            bg_mask = _load_bg_mask(
-                args.stone_mask_path, output_name, original_height, original_width)
-            plane = _fit_background_plane(disp_resized_np, bg_mask)
+            #
+            # With --no_anchor the raw network depth is kept as-is (the model is
+            # trained to be metric on its own on the fixed rig), so the saved .npy is
+            # the direct network output with no plane fitting.
+            plane = None
+            if getattr(args, "no_anchor", False):
+                print("   anchoring disabled (--no_anchor): saving raw metric network depth")
+            else:
+                bg_mask = _load_bg_mask(
+                    args.stone_mask_path, output_name, original_height, original_width)
+                plane = _fit_background_plane(disp_resized_np, bg_mask)
             if plane is not None:
                 cy, cx = original_height // 2, original_width // 2
                 if args.ref_plane_depth > 0:
@@ -174,7 +182,7 @@ def test_simple(args):
                     # Height above the plane; +ve = protruding toward the camera.
                     disp_resized_np = (plane - disp_resized_np).astype(np.float32)
                     print("   anchored (relief): output is plane-relative height in m")
-            else:
+            elif not getattr(args, "no_anchor", False):
                 print("   anchoring skipped (background plane fit failed)")
             # ---------------------------------------------------------------------
 
