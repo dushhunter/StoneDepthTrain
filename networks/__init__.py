@@ -7,5 +7,7 @@ from .Unet import Unet
 from .lite_depth_decoder_QTR import Lite_Depth_Decoder_QueryTr
 from .lite_res_encoder import LiteResnetEncoderDecoder
 from .rectify_net import RectifyNet
+from .edge_refine import EdgeRefine
 from .mvs_feature import MVSFeatureNet
 from .mvs_cost import PlaneSweepMVS
+from .dinov2_encoder import DINOv2Encoder, is_dinov2_backbone
