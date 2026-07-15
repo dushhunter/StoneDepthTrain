@@ -915,8 +915,10 @@ class Trainer:
 
         g_abs_rel = g_abs_rel_sum / g_n
         g_rmse = (g_se_sum / g_n) ** 0.5
-        print("  Epoch {} full val (scene): abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)".format(
-            self.epoch, g_abs_rel, g_rmse, g_rmse * 1000))
+        print("  Epoch {} full val (scene) RAW/unaligned [scale not observable from a "
+              "single image on this varying-distance rig - expected high, ignore]: "
+              "abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)".format(
+                  self.epoch, g_abs_rel, g_rmse, g_rmse * 1000))
 
         self.writers["val"].add_scalar("epoch/abs_rel", g_abs_rel, self.epoch)
         self.writers["val"].add_scalar("epoch/rmse", g_rmse, self.epoch)
@@ -941,7 +943,8 @@ class Trainer:
             d1 = s_within[1.0] / s_n
             d2 = s_within[2.0] / s_n
             d5 = s_within[5.0] / s_n
-            print("    stone-region: abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)  "
+            print("    stone-region RAW/unaligned [ignore, see DEPLOYABLE below]: "
+                  "abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)  "
                   "<1mm={:.3f} <2mm={:.3f} <5mm={:.3f}".format(
                       s_abs_rel, s_rmse, s_rmse * 1000, d1, d2, d5))
             self.writers["val"].add_scalar("epoch/stone_rmse_mm", s_rmse * 1000, self.epoch)
@@ -991,6 +994,38 @@ class Trainer:
         # SPIdepth-style 7-metric suite (per-image mean), four variants.
         suite_avg = {k: (suite_sum[k] / suite_cnt[k]) if suite_cnt[k] > 0 else None
                      for k in suite_variants}
+
+        # ---- DEPLOYABLE absolute depth error (the number to actually track) -------
+        # On this rig the per-stone camera distance varies (~0.32-0.98m across stones),
+        # so a held-out stone's absolute scale is not observable from a single image and
+        # the RAW absolute RMSE above is dominated by that unrecoverable global scalar.
+        # At deployment the scalar is supplied from the available GT/reference (the
+        # standard SPIdepth per-image median-alignment protocol), which gives the true,
+        # deployable absolute depth error. That is what we report as the headline.
+        img_ms = suite_avg.get("img_ms")
+        stone_ms = suite_avg.get("stone_ms")
+        scene_dep_mm = img_ms[2] * 1000 if img_ms is not None else None
+        stone_dep_mm = (stone_ms[2] * 1000 if stone_ms is not None
+                        else s_rmse_medscaled_mm)
+        print("  Epoch {} >>> DEPLOYABLE absolute depth error (GT scale-aligned, "
+              "SPIdepth protocol):".format(self.epoch))
+        print("        scene rmse={}   stone rmse={}   [stone <1mm={:.3f} <2mm={:.3f} "
+              "<5mm={:.3f}]".format(
+                  "{:.3f}mm".format(scene_dep_mm) if scene_dep_mm is not None else "n/a",
+                  "{:.3f}mm".format(stone_dep_mm) if stone_dep_mm is not None else "n/a",
+                  d1 if d1 is not None else float('nan'),
+                  d2 if d2 is not None else float('nan'),
+                  d5 if d5 is not None else float('nan')))
+        if scene_dep_mm is not None:
+            self.writers["val"].add_scalar(
+                "epoch/scene_rmse_deploy_mm", scene_dep_mm, self.epoch)
+            mlflow_metrics["scene_rmse_deploy_mm"] = scene_dep_mm
+        if stone_dep_mm is not None:
+            self.writers["val"].add_scalar(
+                "epoch/stone_rmse_deploy_mm", stone_dep_mm, self.epoch)
+            mlflow_metrics["stone_rmse_deploy_mm"] = stone_dep_mm
+        # ---------------------------------------------------------------------------
+
         self._print_depth_metric_table(suite_avg)
         self._append_depth_metrics_csv(suite_avg)
         metric7 = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
