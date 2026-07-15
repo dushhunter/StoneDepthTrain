@@ -32,6 +32,10 @@ class SQLdepth(nn.Module):
             self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone='convnext_large', in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels, decoder_norm=decoder_norm)
         elif opt.backbone in ["resnet", "resnet_lite"]:
             self.encoder = networks.ResnetEncoderDecoder(num_layers=self.opt.num_layers, num_features=self.opt.num_features, model_dim=self.opt.model_dim)
+        elif networks.is_dinov2_backbone(opt.backbone):
+            self.encoder = networks.DINOv2Encoder(
+                backbone=opt.backbone, model_dim=opt.model_dim,
+                pretrained=(not opt.load_pretrained_model))
         elif opt.model_type in ["nyu_pth_model", "eff_b5"]:
             self.encoder = BaseEncoder.build(num_features=opt.num_features, model_dim=opt.model_dim)
         else:
