@@ -644,6 +644,28 @@ class MonodepthOptions:
                                  nargs="+", type=int,
                                  help="turntable frame offsets used as MVS source views (e.g. -8 -4 4 8)",
                                  default=[-8, -4, 4, 8])
+        self.parser.add_argument("--no_anchor",
+                                 action="store_true",
+                                 help=("skip background-plane anchoring at inference and save the raw network "
+                                       "depth (the model is trained to be metric on its own on the fixed rig). "
+                                       "The saved npy/<name>.npy is then the direct metric network output."))
+        self.parser.add_argument("--distill_out",
+                                 type=str, default="",
+                                 help=("output root for MVS teacher labels. Depth maps are written as "
+                                       "<distill_out>/<stone>/depth_XXXX.png (uint16, mm) so the monocular "
+                                       "trainer can consume them via --gt_depth_path <distill_out> "
+                                       "--gt_depth_subdir '' --gt_depth_encoding uint16 --gt_depth_scale 1000."))
+        self.parser.add_argument("--distill_folders",
+                                 nargs="+", type=str, default=[],
+                                 help=("stone folders to label (e.g. stone_01 stone_02). If empty, the unique "
+                                       "folders in splits/<split>/train_files.txt are used."))
+        self.parser.add_argument("--mvs_seq_path",
+                                 type=str, default="",
+                                 help=("full turntable sequence folder (all NNNN.png frames of ONE stone) that "
+                                       "provides the source neighbour views and the intrinsics folder key. Use "
+                                       "this when --image_path holds only a few reference frames (e.g. "
+                                       "test_results): the reference frame is read from --image_path but its "
+                                       "MVS neighbours come from here. If empty, --image_path is used for both."))
         self.parser.add_argument("--mvs_num_depth_coarse", type=int, default=48)
         self.parser.add_argument("--mvs_num_depth_fine", type=int, default=48)
         self.parser.add_argument("--mvs_fine_range_mm", type=float, default=20.0)
