@@ -260,6 +260,13 @@ class MonodepthOptions:
                                  type=float,
                                  help="weight for surface-normal loss (angular surface matching)",
                                  default=0.0)
+        self.parser.add_argument("--gt_plane_weight",
+                                 type=float,
+                                 help=("weight for the background-plane anchor loss: an extra L1 on the "
+                                       "non-stone (flat surface) pixels. On a fixed rig the surface depth "
+                                       "fixes the absolute scale, so pinning it hard makes the model metric "
+                                       "on its own (kills the ~30%% global-scale error)."),
+                                 default=0.0)
         self.parser.add_argument("--gt_relief_weight",
                                  type=float,
                                  help=("weight for the plane-relative relief loss: fits a plane to the "
