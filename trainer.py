@@ -79,6 +79,12 @@ class Trainer:
             self.models["encoder"] = networks.LiteResnetEncoderDecoder(model_dim=self.opt.model_dim)
         elif self.opt.backbone == "eff_b5":
             self.models["encoder"] = networks.BaseEncoder.build(num_features=self.opt.num_features, model_dim=self.opt.model_dim)
+        elif networks.is_dinov2_backbone(self.opt.backbone):
+            # Opt-in stronger ViT encoder (DINOv2 / Depth-Anything-V2 style) for
+            # better generalization to unseen stone shapes; SPIdepth depth head unchanged.
+            self.models["encoder"] = networks.DINOv2Encoder(
+                backbone=self.opt.backbone, model_dim=self.opt.model_dim,
+                pretrained=(not self.opt.load_pretrained_model))
         else: 
             self.models["encoder"] = networks.Unet(pretrained=(not self.opt.load_pretrained_model), backbone=self.opt.backbone, in_channels=3, num_classes=self.opt.model_dim, decoder_channels=self.opt.dec_channels, decoder_norm=getattr(self.opt, "decoder_norm", "group"))
 
@@ -1446,6 +1452,19 @@ class Trainer:
                 losses["loss/gt_depth"] = gt_loss
                 losses["loss/gt_silog"] = gt_log
                 total_loss += self.opt.gt_depth_weight * gt_loss
+
+                # Background-plane anchor: extra absolute L1 on the flat-surface
+                # (non-stone) pixels. On a fixed camera/surface rig the surface depth
+                # determines the absolute scale, so pinning it hard forces the model
+                # to be metric on its own instead of only scale-relatively correct.
+                plane_weight = getattr(self.opt, 'gt_plane_weight', 0.0)
+                if plane_weight > 0 and fg is not None:
+                    bg = valid & (fg < 0.5)
+                    bg_n = bg.float().sum().clamp(min=1.0)
+                    if bg.any():
+                        plane_loss = (torch.abs(depth_pred_gt - depth_gt) * bg.float()).sum() / bg_n
+                        losses["loss/gt_plane"] = plane_loss
+                        total_loss += plane_weight * plane_loss
 
                 # Deep supervision for the coarse MVS stage: a light weighted-L1 on
                 # the coarse depth keeps the cascade's first estimate close to GT so
