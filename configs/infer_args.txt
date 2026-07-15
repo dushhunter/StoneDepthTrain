@@ -2,14 +2,13 @@
 --backbone convnext_large
 --model_dim 32
 --patch_size 16
---dim_out 256
+--dim_out 512
 --query_nums 64
 --dec_channels 1024 512 256 128
 --min_depth 0.30
 --max_depth 1.00
 --decoder_norm group
 --prob_temperature 1.0
---use_edge_refine
 --edge_refine_channels 32
 --load_pretrained_model
 --load_pt_folder stone_weights/stone_final/models/weight_22
@@ -17,3 +16,4 @@
 --ext png
 --height 576
 --width 1024
+--no_anchor
