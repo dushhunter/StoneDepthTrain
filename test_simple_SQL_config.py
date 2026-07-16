@@ -19,107 +19,6 @@ from torchvision import transforms, datasets
 from SQLdepth import MonodepthOptions, SQLdepth
 STEREO_SCALE_FACTOR = 5.4
 
-
-def _load_bg_mask(mask_dir, name, height, width):
-    """Load a background mask (1 = background/flat surface, 0 = stone) or None.
-
-    Stone masks follow the training convention (foreground stone > 127). Files may
-    be named mask_<name>.<ext> or <name>.<ext>.
-    """
-    if not mask_dir:
-        return None
-    for cand in ("mask_{}.png".format(name), "{}.png".format(name),
-                 "mask_{}.jpg".format(name), "{}.jpg".format(name)):
-        p = os.path.join(mask_dir, cand)
-        if os.path.isfile(p):
-            m = pil.open(p).convert("L").resize((width, height), pil.NEAREST)
-            return (np.array(m) <= 127).astype(np.float32)  # background = not stone
-    return None
-
-
-def _decode_float32_rgba_depth(depth_img):
-    """Decode lossless float32 depth packed into RGBA PNG channels (training format)."""
-    rgba = np.array(depth_img.convert("RGBA"), dtype=np.uint8)
-    h, w, _ = rgba.shape
-    return rgba.reshape(-1, 4).view("<f4").reshape(h, w).copy()
-
-
-def _load_gt_depth(gt_dir, name, height, width, encoding="float32_rgba", scale=100000.0):
-    """Load the GT metric depth (metres) for image <name>, resized to (height, width).
-
-    Used by --gt_scale to align the prediction's global scale to GT (the standard
-    SPIdepth per-image median protocol). On this rig the camera-to-surface distance
-    varies per stone, so a held-out stone's absolute scale is unrecoverable from one
-    image; GT supplies that single missing scalar.
-
-    Accepts files named <name>.png, depth_<name>.png, or depth_<int:04d>.png (when the
-    image name is numeric, matching the training depth_XXXX.png convention). Returns a
-    float32 [H, W] array in metres, or None if not found.
-    """
-    if not gt_dir:
-        return None
-    cands = ["{}.png".format(name), "depth_{}.png".format(name)]
-    digits = "".join(ch for ch in name if ch.isdigit())
-    if digits:
-        cands.append("depth_{:04d}.png".format(int(digits)))
-    path = None
-    for c in cands:
-        p = os.path.join(gt_dir, c)
-        if os.path.isfile(p):
-            path = p
-            break
-    if path is None:
-        return None
-    with open(path, "rb") as f:
-        img = pil.open(f)
-        img = img.copy()  # detach from file handle before it closes
-    if encoding == "float32_rgba" or (encoding == "auto" and img.mode == "RGBA"):
-        depth = _decode_float32_rgba_depth(img).astype(np.float32)
-    else:
-        depth = np.array(img, dtype=np.float32) / float(scale)
-    if depth.shape != (height, width):
-        # NEAREST resize preserves metric values (no interpolation across depth edges).
-        dp = pil.fromarray(depth, mode="F").resize((width, height), pil.NEAREST)
-        depth = np.array(dp, dtype=np.float32)
-    return depth
-
-
-def _fit_background_plane(depth, bg_mask=None, iters=5, k=2.5, min_pixels=200):
-    """Robustly fit a plane z = a*u + b*v + c to the flat background of a depth map.
-
-    The flat surface dominates the image, so an iteratively reweighted least-squares
-    fit (dropping >k MAD residuals each round) converges to the background plane and
-    rejects the small stone bump even when no mask is supplied. Returns the full-frame
-    plane depth [H, W] (float32) or None if the fit is not possible.
-    """
-    h, w = depth.shape
-    ys, xs = np.mgrid[0:h, 0:w]
-    u = (xs / max(w - 1, 1)).astype(np.float64).ravel()
-    v = (ys / max(h - 1, 1)).astype(np.float64).ravel()
-    z = depth.astype(np.float64).ravel()
-    valid = np.isfinite(z) & (z > 1e-6)
-    if bg_mask is not None:
-        valid &= (bg_mask.ravel() > 0.5)
-    idx = np.where(valid)[0]
-    if idx.size < min_pixels:
-        return None
-    A = np.stack([u, v, np.ones_like(u)], axis=1)
-    sel = idx
-    coeff = None
-    for _ in range(iters):
-        coeff, *_ = np.linalg.lstsq(A[sel], z[sel], rcond=None)
-        resid = z[idx] - A[idx] @ coeff
-        med = np.median(resid)
-        mad = np.median(np.abs(resid - med)) + 1e-9
-        inl = np.abs(resid - med) < k * 1.4826 * mad
-        new_sel = idx[inl]
-        if new_sel.size < min_pixels or new_sel.size == sel.size:
-            break
-        sel = new_sel
-    if coeff is None:
-        return None
-    return (A @ coeff).reshape(h, w).astype(np.float32)
-
 def test_simple(args):
     """Function to predict for a single image or folder of images
     """
@@ -197,63 +96,6 @@ def test_simple(args):
 
             # Saving colormapped depth image
             disp_resized_np = disp_resized.squeeze().cpu().numpy()
-
-            # --- Recover the global scale ----------------------------------------
-            # The camera-to-surface distance varies per stone, so a held-out stone's
-            # absolute scale is unrecoverable from a single image; the raw network
-            # depth is correct up to one global scalar. Three modes:
-            #   --gt_scale : align the prediction to the per-image GT median (the
-            #                standard SPIdepth protocol). This is the recommended /
-            #                default path for held-out synthetic stones with GT.
-            #   --no_anchor: save the raw network depth as-is (no scale recovery).
-            #   default    : fit the flat surface and either rescale to
-            #                --ref_plane_depth (absolute) or subtract it (relief).
-            plane = None
-            if getattr(args, "gt_scale", False):
-                gt_depth = _load_gt_depth(
-                    args.gt_depth_dir, output_name, original_height, original_width,
-                    getattr(args, "gt_depth_encoding", "float32_rgba"),
-                    getattr(args, "gt_depth_scale", 100000.0))
-                if gt_depth is None:
-                    print("   gt-scale skipped: no GT depth found for '{}' in '{}'".format(
-                        output_name, args.gt_depth_dir))
-                else:
-                    valid = (np.isfinite(gt_depth) & (gt_depth > args.min_depth)
-                             & (gt_depth < args.max_depth))
-                    sel = valid & np.isfinite(disp_resized_np) & (disp_resized_np > 1e-6)
-                    if sel.sum() > 64:
-                        s = float(np.median(gt_depth[sel])
-                                  / max(float(np.median(disp_resized_np[sel])), 1e-6))
-                        disp_resized_np = (disp_resized_np * s).astype(np.float32)
-                        print("   gt-scale aligned: scale={:.4f} (median GT/pred over "
-                              "{} px)".format(s, int(sel.sum())))
-                    else:
-                        print("   gt-scale skipped: too few valid GT pixels ({})".format(
-                            int(sel.sum())))
-            elif getattr(args, "no_anchor", False):
-                print("   anchoring disabled (--no_anchor): saving raw metric network depth")
-            else:
-                bg_mask = _load_bg_mask(
-                    args.stone_mask_path, output_name, original_height, original_width)
-                plane = _fit_background_plane(disp_resized_np, bg_mask)
-            if plane is not None:
-                cy, cx = original_height // 2, original_width // 2
-                if args.ref_plane_depth > 0:
-                    denom = float(plane[cy, cx])
-                    if abs(denom) < 1e-6:
-                        denom = float(np.median(plane))
-                    scale = args.ref_plane_depth / denom
-                    disp_resized_np = (disp_resized_np * scale).astype(np.float32)
-                    print("   anchored (absolute): plane_center={:.4f}m -> ref={:.4f}m "
-                          "(scale={:.4f})".format(denom, args.ref_plane_depth, scale))
-                else:
-                    # Height above the plane; +ve = protruding toward the camera.
-                    disp_resized_np = (plane - disp_resized_np).astype(np.float32)
-                    print("   anchored (relief): output is plane-relative height in m")
-            elif not getattr(args, "no_anchor", False) and not getattr(args, "gt_scale", False):
-                print("   anchoring skipped (background plane fit failed)")
-            # ---------------------------------------------------------------------
-
             vmax = np.percentile(disp_resized_np, 95)
 
             # Saving uint16 depth map
@@ -261,9 +103,7 @@ def test_simple(args):
             if not os.path.exists(to_save_dir):
                 os.makedirs(to_save_dir)
             to_save_path = os.path.join(to_save_dir, "{}.png".format(output_name))
-            # Clip negatives so relief-mode output (plane - depth) does not wrap uint16;
-            # the float32 .npy below keeps the true signed values.
-            to_save = (np.clip(disp_resized_np, 0, None) * 1000).astype('uint16')
+            to_save = (disp_resized_np * 1000).astype('uint16')
             pil.fromarray(to_save).save(to_save_path)
 
             # Saving float32 NPY depth map (metric metres, for downstream 3D reconstruction)
