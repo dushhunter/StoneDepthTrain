@@ -54,10 +54,6 @@ class Trainer:
         self.models = {}
         self.parameters_to_train = []
 
-        # Cost-volume MVS mode: triangulate metric depth from known-pose neighbours
-        # instead of the monocular head. See networks/mvs_*.py.
-        self.use_mvs = getattr(self.opt, "use_mvs", False)
-
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
         self.num_scales = len(self.opt.scales) # default=[0], we only perform single scale training
@@ -79,12 +75,6 @@ class Trainer:
             self.models["encoder"] = networks.LiteResnetEncoderDecoder(model_dim=self.opt.model_dim)
         elif self.opt.backbone == "eff_b5":
             self.models["encoder"] = networks.BaseEncoder.build(num_features=self.opt.num_features, model_dim=self.opt.model_dim)
-        elif networks.is_dinov2_backbone(self.opt.backbone):
-            # Opt-in stronger ViT encoder (DINOv2 / Depth-Anything-V2 style) for
-            # better generalization to unseen stone shapes; SPIdepth depth head unchanged.
-            self.models["encoder"] = networks.DINOv2Encoder(
-                backbone=self.opt.backbone, model_dim=self.opt.model_dim,
-                pretrained=(not self.opt.load_pretrained_model))
         else: 
             self.models["encoder"] = networks.Unet(pretrained=(not self.opt.load_pretrained_model), backbone=self.opt.backbone, in_channels=3, num_classes=self.opt.model_dim, decoder_channels=self.opt.dec_channels, decoder_norm=getattr(self.opt, "decoder_norm", "group"))
 
@@ -172,42 +162,6 @@ class Trainer:
         #     self.models["predictive_mask"].to(self.device)
         #     self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
-        # Cost-volume MVS head. When enabled, the shared feature extractor + cascade
-        # plane-sweep network replace the monocular encoder/depth head as the only
-        # trained parameters (the monocular nets stay built for API compatibility but
-        # are frozen and unused). Requires --use_known_pose for the metric transforms.
-        if self.use_mvs:
-            assert self.opt.use_known_pose, "--use_mvs requires --use_known_pose (metric turntable transforms)"
-            feat_ch = getattr(self.opt, "mvs_feature_ch", 32)
-            feat_scale = getattr(self.opt, "mvs_feat_scale", 8)
-            self.models["mvs_feature"] = networks.MVSFeatureNet(
-                out_ch=feat_ch, feat_scale=feat_scale).cuda()
-            self.models["mvs"] = networks.PlaneSweepMVS(
-                feat_ch=feat_ch,
-                num_groups=getattr(self.opt, "mvs_num_groups", 8),
-                feat_scale=feat_scale,
-                min_depth=self.opt.min_depth, max_depth=self.opt.max_depth,
-                ndepth_coarse=getattr(self.opt, "mvs_num_depth_coarse", 48),
-                ndepth_fine=getattr(self.opt, "mvs_num_depth_fine", 48),
-                fine_range_mm=getattr(self.opt, "mvs_fine_range_mm", 20.0)).cuda()
-            self.models["mvs_feature"] = torch.nn.DataParallel(self.models["mvs_feature"])
-            self.models["mvs"] = torch.nn.DataParallel(self.models["mvs"])
-
-            # Freeze the (unused) monocular nets and train only the MVS parameters.
-            for name in ("encoder", "depth", "pose", "refine"):
-                if name in self.models:
-                    for p in self.models[name].parameters():
-                        p.requires_grad_(False)
-            self.parameters_to_train = list(self.models["mvs_feature"].parameters()) \
-                + list(self.models["mvs"].parameters())
-
-            # MVS source views for training = the non-zero frame_ids the dataset loads.
-            # (--mvs_frame_offsets is honoured by the standalone inference script; here
-            # frame_ids is authoritative so the required colours are actually present.)
-            offs = [f for f in self.opt.frame_ids if f != 0 and f != "s"]
-            assert len(offs) >= 1, "MVS needs frame_ids with >=1 non-zero source offset"
-            self.mvs_offsets = offs
-
         weight_decay = getattr(self.opt, "weight_decay", 0.0)
         if self.opt.diff_lr :
             df_params = [{"params": self.pose_params, "lr": self.opt.learning_rate / 10},
@@ -265,7 +219,7 @@ class Trainer:
                 use_scale_aug=getattr(self.opt, "use_scale_aug", False),
                 scale_aug_max=getattr(self.opt, "scale_aug_max", 1.15),
                 scale_aug_prob=getattr(self.opt, "scale_aug_prob", 0.5),
-                cyclic_frames=getattr(self.opt, "use_mvs", False),
+                cyclic_frames=False,
                 frames_per_seq=getattr(self.opt, "frames_per_seq", 120))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             train_dataset = self.dataset(
@@ -289,7 +243,7 @@ class Trainer:
                 gt_depth_subdir=self.opt.gt_depth_subdir,
                 gt_depth_encoding=self.opt.gt_depth_encoding,
                 gt_depth_scale=self.opt.gt_depth_scale,
-                cyclic_frames=getattr(self.opt, "use_mvs", False),
+                cyclic_frames=False,
                 frames_per_seq=getattr(self.opt, "frames_per_seq", 120))
         elif self.opt.dataset in ["mc_dataset"]:  # StoneVol_main: MonoDatasetMultiCam needs intrinsics_file_path
             val_dataset = self.dataset(
@@ -343,7 +297,7 @@ class Trainer:
             return float(self.opt.turntable_axis_depth)
         # Prefer the true per-folder metric axis distance if the dataset supplied it
         # (optional 6th column of the intrinsics file). This gives correct absolute
-        # scale for the MVS plane sweep without relying on GT at deployment.
+        # scale for the known-pose turntable warp without relying on GT at deployment.
         if "axis_depth" in inputs:
             try:
                 return float(inputs["axis_depth"].float().mean().item())
@@ -523,11 +477,6 @@ class Trainer:
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
 
-        if self.use_mvs:
-            outputs = self.run_mvs(inputs)
-            losses = self.compute_losses(inputs, outputs)
-            return outputs, losses
-
         if self.opt.pose_model_type == "shared": # default no
             # If we are using a shared encoder for both depth and pose (as advocated
             # in monodepthv1), then all images are fed separately through the depth encoder.
@@ -562,42 +511,6 @@ class Trainer:
         losses = self.compute_losses(inputs, outputs)
 
         return outputs, losses
-
-    def run_mvs(self, inputs):
-        """Cost-volume MVS forward pass -> metric depth in the reference frame.
-
-        Builds shared features for the reference view (frame 0) and every source
-        view, obtains the known metric cam_T_cam(0->src) transforms, runs the
-        cascade plane sweep, and writes full-resolution metric depth into the
-        standard output keys so the existing GT losses / validation work unchanged.
-        """
-        # Use the un-augmented colour for cross-view matching (colour jitter would
-        # break photo-consistency between the reference and source features).
-        ref = inputs[("color", 0, 0)]
-        feat_ref = self.models["mvs_feature"](ref)
-        feat_srcs, Ts = [], []
-
-        pose_out = self.predict_poses(inputs, None)  # known-pose branch, metric transforms
-        for f in self.mvs_offsets:
-            feat_srcs.append(self.models["mvs_feature"](inputs[("color", f, 0)]))
-            Ts.append(pose_out[("cam_T_cam", 0, f)])
-
-        K3x3 = inputs[("K3x3", 0)].float()  # [B, 3, 3] full-res intrinsics
-        mvs_out = self.models["mvs"](feat_ref, feat_srcs, Ts, K3x3)
-
-        H, W = ref.shape[-2:]
-        depth = F.interpolate(mvs_out["depth"], size=(H, W),
-                              mode="bilinear", align_corners=False)
-        depth_coarse = F.interpolate(mvs_out["depth_coarse"], size=(H, W),
-                                     mode="bilinear", align_corners=False)
-
-        outputs = {}
-        # Both keys hold the metric depth (MVS predicts depth directly, not disparity),
-        # so the GT loss (reads ("depth",0,0)) and validation (reads ("disp",0)) agree.
-        outputs[("disp", 0)] = depth
-        outputs[("depth", 0, 0)] = depth
-        outputs[("mvs_coarse", 0)] = depth_coarse
-        return outputs
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -800,14 +713,11 @@ class Trainer:
                 for key, ipt in inputs.items():
                     inputs[key] = ipt.to(self.device)
 
-                if self.use_mvs:
-                    outputs = self.run_mvs(inputs)
-                else:
-                    features = self.models["encoder"](inputs["color_aug", 0, 0])
-                    outputs = self.models["depth"](features)
-                    if "refine" in self.models:
-                        outputs[("disp", 0)] = self.models["refine"](
-                            outputs[("disp", 0)], inputs[("color", 0, 0)])
+                features = self.models["encoder"](inputs["color_aug", 0, 0])
+                outputs = self.models["depth"](features)
+                if "refine" in self.models:
+                    outputs[("disp", 0)] = self.models["refine"](
+                        outputs[("disp", 0)], inputs[("color", 0, 0)])
 
                 if "depth_gt" not in inputs:
                     self.set_train()
@@ -1366,19 +1276,6 @@ class Trainer:
                         plane_loss = (torch.abs(depth_pred_gt - depth_gt) * bg.float()).sum() / bg_n
                         losses["loss/gt_plane"] = plane_loss
                         total_loss += plane_weight * plane_loss
-
-                # Deep supervision for the coarse MVS stage: a light weighted-L1 on
-                # the coarse depth keeps the cascade's first estimate close to GT so
-                # the fine sweep window (+/- fine_range_mm) actually brackets the true
-                # surface. Uses the same per-pixel weight map as the primary loss.
-                if ("mvs_coarse", 0) in outputs:
-                    coarse = outputs[("mvs_coarse", 0)]
-                    if coarse.shape[-2:] != depth_gt.shape[-2:]:
-                        coarse = F.interpolate(coarse, depth_gt.shape[-2:],
-                                               mode="bilinear", align_corners=False)
-                    coarse_l1 = (w_valid * torch.abs(coarse - depth_gt)).sum() / denom
-                    losses["loss/mvs_coarse"] = coarse_l1
-                    total_loss += 0.5 * self.opt.gt_depth_weight * coarse_l1
 
                 # Depth-gradient loss: force the model to match surface slopes,
                 # not just absolute depth values. This captures curvature/detail and,
