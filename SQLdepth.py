@@ -639,6 +639,26 @@ class MonodepthOptions:
                                        "input images, e.g. mask_0001.png or 0001.png). When present, mask pixels "
                                        "are excluded from the background-plane fit for a cleaner anchor."),
                                  default="")
+        self.parser.add_argument("--gt_scale",
+                                 action="store_true",
+                                 help=("recover the global scale by aligning the prediction to the per-image "
+                                       "GT median (the standard SPIdepth protocol). Recommended for held-out "
+                                       "synthetic stones: the per-stone camera distance varies, so the absolute "
+                                       "scale is unrecoverable from one image and GT supplies the single missing "
+                                       "scalar. The saved npy/<name>.npy is then metric. Requires --gt_depth_dir."))
+        self.parser.add_argument("--gt_depth_dir",
+                                 type=str,
+                                 default="",
+                                 help=("folder of GT depth maps for --gt_scale, named like the input images "
+                                       "(<name>.png, depth_<name>.png, or depth_<int:04d>.png)."))
+        self.parser.add_argument("--gt_depth_encoding",
+                                 type=str,
+                                 default="float32_rgba",
+                                 help="GT depth encoding for --gt_scale: float32_rgba | uint16 | auto.")
+        self.parser.add_argument("--gt_depth_scale",
+                                 type=float,
+                                 default=100000.0,
+                                 help="uint16 GT PNG -> metres divisor (only used when --gt_depth_encoding uint16).")
 
         # ---- Cost-volume MVS inference (test_mvs.py) ----
         self.parser.add_argument("--use_mvs",
