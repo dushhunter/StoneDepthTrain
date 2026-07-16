@@ -215,8 +215,16 @@ class Trainer:
             self.model_optimizer = optim.AdamW(df_params, lr=self.opt.learning_rate, weight_decay=weight_decay)
         else : 
             self.model_optimizer = optim.AdamW(self.parameters_to_train, lr=self.opt.learning_rate, weight_decay=weight_decay) # default lr=1e-4
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, self.opt.scheduler_step_size, 0.1) # default=15
+        if getattr(self.opt, "use_cosine_lr", False):
+            # Smoothly anneal to ~1% of the base LR over the whole run so the model
+            # settles into its optimum instead of wandering at a constant LR (which
+            # made the held-out metric peak early then diverge).
+            self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.model_optimizer, T_max=self.opt.num_epochs,
+                eta_min=self.opt.learning_rate * 0.01)
+        else:
+            self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+                self.model_optimizer, self.opt.scheduler_step_size, 0.1) # default=15
 
         #if self.opt.load_weights_folder is not None:
         #     self.load_model()
@@ -915,203 +923,61 @@ class Trainer:
 
         g_abs_rel = g_abs_rel_sum / g_n
         g_rmse = (g_se_sum / g_n) ** 0.5
-        print("  Epoch {} full val (scene) RAW/unaligned [scale not observable from a "
-              "single image on this varying-distance rig - expected high, ignore]: "
-              "abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)".format(
-                  self.epoch, g_abs_rel, g_rmse, g_rmse * 1000))
-
-        self.writers["val"].add_scalar("epoch/abs_rel", g_abs_rel, self.epoch)
-        self.writers["val"].add_scalar("epoch/rmse", g_rmse, self.epoch)
-        self.writers["val"].add_scalar("epoch/rmse_mm", g_rmse * 1000, self.epoch)
-        mlflow_metrics = {
-            "abs_rel": g_abs_rel,
-            "rmse": g_rmse,
-            "rmse_mm": g_rmse * 1000,
-        }
-
+        mlflow_metrics = {}
         selection_metric = g_rmse  # fall back to scene RMSE if no mask
 
-        # Stone-region values (stay None when no foreground mask is available).
-        s_abs_rel = s_rmse = d1 = d2 = d5 = None
-        # Scale/shape decomposition RMSEs in mm (None if not computed).
+        # Stone-region / median-scaled values are computed only to drive model
+        # selection; they are no longer reported (we report the 7 SPIdepth metrics).
         s_rmse_medscaled_mm = (sms_se_sum / sms_n) ** 0.5 * 1000 if sms_n > 0 else None
-        s_relief_rmse_mm = (relief_se_sum / relief_n) ** 0.5 * 1000 if relief_n > 0 else None
 
         if have_mask and s_n > 0:
-            s_abs_rel = s_abs_rel_sum / s_n
-            s_rmse = (s_se_sum / s_n) ** 0.5
-            d1 = s_within[1.0] / s_n
-            d2 = s_within[2.0] / s_n
-            d5 = s_within[5.0] / s_n
-            print("    stone-region RAW/unaligned [ignore, see DEPLOYABLE below]: "
-                  "abs_rel={:.6f}  rmse={:.6f}m ({:.3f}mm)  "
-                  "<1mm={:.3f} <2mm={:.3f} <5mm={:.3f}".format(
-                      s_abs_rel, s_rmse, s_rmse * 1000, d1, d2, d5))
-            self.writers["val"].add_scalar("epoch/stone_rmse_mm", s_rmse * 1000, self.epoch)
-            self.writers["val"].add_scalar("epoch/stone_abs_rel", s_abs_rel, self.epoch)
-            self.writers["val"].add_scalar("epoch/stone_within_1mm", d1, self.epoch)
-            self.writers["val"].add_scalar("epoch/stone_within_2mm", d2, self.epoch)
-            self.writers["val"].add_scalar("epoch/stone_within_5mm", d5, self.epoch)
-            mlflow_metrics.update({
-                "stone_rmse": s_rmse,
-                "stone_rmse_mm": s_rmse * 1000,
-                "stone_abs_rel": s_abs_rel,
-                "stone_within_1mm": d1,
-                "stone_within_2mm": d2,
-                "stone_within_5mm": d5,
-            })
-            selection_metric = s_rmse  # select best model on stone-region RMSE
+            selection_metric = (s_se_sum / s_n) ** 0.5  # absolute stone-region RMSE
 
-        # Scale/shape decomposition: shows whether the big absolute error is a
-        # fixable global scale (median-scaled small) or true stone shape error.
-        if s_rmse_medscaled_mm is not None or s_relief_rmse_mm is not None:
-            ms = -1.0 if s_rmse_medscaled_mm is None else s_rmse_medscaled_mm
-            rl = -1.0 if s_relief_rmse_mm is None else s_relief_rmse_mm
-            print("    stone scale/shape: median_scaled_rmse={:.3f}mm  "
-                  "plane_relief_rmse={:.3f}mm".format(ms, rl))
-            if s_rmse_medscaled_mm is not None:
-                self.writers["val"].add_scalar(
-                    "epoch/stone_rmse_medscaled_mm", s_rmse_medscaled_mm, self.epoch)
-                mlflow_metrics["stone_rmse_medscaled_mm"] = s_rmse_medscaled_mm
-            if s_relief_rmse_mm is not None:
-                self.writers["val"].add_scalar(
-                    "epoch/stone_relief_rmse_mm", s_relief_rmse_mm, self.epoch)
-                mlflow_metrics["stone_relief_rmse_mm"] = s_relief_rmse_mm
-
-        # Model selection. By default we select on the ABSOLUTE stone RMSE (metres),
-        # because the goal is a metric-on-its-own model (no test-time anchoring) - the
-        # raw stone RMSE is exactly what deployment sees. Pass --select_on_medscaled to
-        # instead select on the median-scaled stone RMSE (matches an anchored-at-
-        # deployment protocol), which is the previous behaviour.
+        # --select_on_medscaled selects on the median-scaled stone RMSE (anchored-at-
+        # deploy protocol); otherwise the absolute stone RMSE above is used.
         if getattr(self.opt, "select_on_medscaled", False) and s_rmse_medscaled_mm is not None:
             selection_metric = s_rmse_medscaled_mm / 1000.0
-            print("    -> model selection metric (anchored median-scaled): "
-                  "{:.3f}mm".format(s_rmse_medscaled_mm))
-        elif selection_metric is not None:
-            print("    -> model selection metric (absolute stone RMSE): "
-                  "{:.3f}mm".format(selection_metric * 1000.0))
 
-        # SPIdepth-style 7-metric suite (per-image mean), four variants.
+        # SPIdepth 7-metric suite (per-image mean). We report only the whole-image,
+        # median-scaled variant (img_ms) - the exact SPIdepth protocol.
         suite_avg = {k: (suite_sum[k] / suite_cnt[k]) if suite_cnt[k] > 0 else None
                      for k in suite_variants}
 
-        # ---- DEPLOYABLE absolute depth error (the number to actually track) -------
-        # On this rig the per-stone camera distance varies (~0.32-0.98m across stones),
-        # so a held-out stone's absolute scale is not observable from a single image and
-        # the RAW absolute RMSE above is dominated by that unrecoverable global scalar.
-        # At deployment the scalar is supplied from the available GT/reference (the
-        # standard SPIdepth per-image median-alignment protocol), which gives the true,
-        # deployable absolute depth error. That is what we report as the headline.
-        img_ms = suite_avg.get("img_ms")
-        stone_ms = suite_avg.get("stone_ms")
-        scene_dep_mm = img_ms[2] * 1000 if img_ms is not None else None
-        stone_dep_mm = (stone_ms[2] * 1000 if stone_ms is not None
-                        else s_rmse_medscaled_mm)
-        print("  Epoch {} >>> DEPLOYABLE absolute depth error (GT scale-aligned, "
-              "SPIdepth protocol):".format(self.epoch))
-        print("        scene rmse={}   stone rmse={}   [stone <1mm={:.3f} <2mm={:.3f} "
-              "<5mm={:.3f}]".format(
-                  "{:.3f}mm".format(scene_dep_mm) if scene_dep_mm is not None else "n/a",
-                  "{:.3f}mm".format(stone_dep_mm) if stone_dep_mm is not None else "n/a",
-                  d1 if d1 is not None else float('nan'),
-                  d2 if d2 is not None else float('nan'),
-                  d5 if d5 is not None else float('nan')))
-        if scene_dep_mm is not None:
-            self.writers["val"].add_scalar(
-                "epoch/scene_rmse_deploy_mm", scene_dep_mm, self.epoch)
-            mlflow_metrics["scene_rmse_deploy_mm"] = scene_dep_mm
-        if stone_dep_mm is not None:
-            self.writers["val"].add_scalar(
-                "epoch/stone_rmse_deploy_mm", stone_dep_mm, self.epoch)
-            mlflow_metrics["stone_rmse_deploy_mm"] = stone_dep_mm
-        # ---------------------------------------------------------------------------
-
-        self._print_depth_metric_table(suite_avg)
-        self._append_depth_metrics_csv(suite_avg)
         metric7 = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
-        for variant, vals in suite_avg.items():
-            if vals is not None:
-                for name, v in zip(metric7, vals):
-                    mlflow_metrics["{}_{}".format(variant, name)] = float(v)
+        img_ms = suite_avg.get("img_ms")
+        if img_ms is not None:
+            print("  Epoch {} val (whole-image, median-scaled; SPIdepth protocol): "
+                  "AbsRel={:.4f} SqRel={:.4f} RMSE={:.4f} RMSElog={:.4f} "
+                  "d1={:.4f} d2={:.4f} d3={:.4f}".format(self.epoch, *img_ms))
+            for name, v in zip(metric7, img_ms):
+                self.writers["val"].add_scalar(
+                    "epoch/{}".format(name), float(v), self.epoch)
+                mlflow_metrics[name] = float(v)
 
         self.mlflow.log_metrics(mlflow_metrics, step=self.epoch, prefix="val_epoch")
 
-        # Persist per-epoch validation metrics to a CSV for offline inspection.
-        self._append_val_metrics_csv(
-            g_abs_rel, g_rmse, s_abs_rel, s_rmse, d1, d2, d5,
-            s_rmse_medscaled_mm, s_relief_rmse_mm)
+        # Persist the 7 SPIdepth metrics (whole-image, median-scaled) per epoch.
+        self._append_val_metrics_csv(suite_avg)
 
         return selection_metric
 
-    def _print_depth_metric_table(self, suite_avg):
-        """Print the four-variant 7-metric suite as a compact SPIdepth-style table."""
-        labels = [
-            ("img_ms", "img  (scaled)"),
-            ("img_abs", "img  (abs)   "),
-            ("stone_ms", "stone(scaled)"),
-            ("stone_abs", "stone(abs)   "),
-        ]
-        print("  Epoch {} depth metrics (per-image mean; 'scaled' = median-scaled, "
-              "SPIdepth protocol):".format(self.epoch))
-        print("                 AbsRel   SqRel    RMSE     RMSElog  d1      d2      d3")
-        for key, label in labels:
-            vals = suite_avg.get(key)
-            if vals is None:
-                continue
-            ar, sr, rm, rl, a1, a2, a3 = vals
-            note = "  <- compare to SPIdepth" if key == "img_ms" else ""
-            print("   {}  {:.4f}   {:.4f}   {:.4f}   {:.4f}   {:.4f}  {:.4f}  {:.4f}{}".format(
-                label, ar, sr, rm, rl, a1, a2, a3, note))
+    def _append_val_metrics_csv(self, suite_avg):
+        """Append the 7 SPIdepth metrics (whole-image, median-scaled) for this epoch.
 
-    def _append_depth_metrics_csv(self, suite_avg):
-        """Append the four-variant 7-metric suite for this epoch to depth_metrics.csv."""
-        csv_path = os.path.join(self.log_path, "depth_metrics.csv")
-        metric7 = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
-        header = ["epoch"]
-        for variant in ("img_ms", "img_abs", "stone_ms", "stone_abs"):
-            header += ["{}_{}".format(variant, m) for m in metric7]
-
-        row = [str(self.epoch)]
-        for variant in ("img_ms", "img_abs", "stone_ms", "stone_abs"):
-            vals = suite_avg.get(variant)
-            if vals is None:
-                row += [""] * 7
-            else:
-                row += ["{:.6f}".format(float(v)) for v in vals]
-
-        write_header = not os.path.isfile(csv_path)
-        with open(csv_path, "a") as f:
-            if write_header:
-                f.write(",".join(header) + "\n")
-            f.write(",".join(row) + "\n")
-        print("  -> depth metrics appended to {}".format(csv_path))
-
-    def _append_val_metrics_csv(self, g_abs_rel, g_rmse,
-                                s_abs_rel, s_rmse, d1, d2, d5,
-                                s_rmse_medscaled_mm=None, s_relief_rmse_mm=None):
-        """Append one row of validation metrics per epoch to val_metrics.csv.
-
-        Written to {log_path}/val_metrics.csv. Stone-region columns are left
-        blank for epochs where no foreground mask was available.
+        Written to {log_path}/val_metrics.csv as:
+        epoch, AbsRel, SqRel, RMSE, RMSE(log), delta<1.25, delta<1.25^2, delta<1.25^3
+        - the standard SPIdepth protocol (per-image median-aligned to GT). The row is
+        left blank for epochs where the median-scaled variant was unavailable.
         """
         csv_path = os.path.join(self.log_path, "val_metrics.csv")
-        header = ["epoch", "scene_abs_rel", "scene_rmse_m", "scene_rmse_mm",
-                  "stone_abs_rel", "stone_rmse_m", "stone_rmse_mm",
-                  "stone_within_1mm", "stone_within_2mm", "stone_within_5mm",
-                  "stone_rmse_medscaled_mm", "stone_relief_rmse_mm"]
+        header = ["epoch", "abs_rel", "sq_rel", "rmse", "rmse_log",
+                  "delta_1.25", "delta_1.25^2", "delta_1.25^3"]
 
-        def _fmt(v, mm=False, prec=6):
-            if v is None:
-                return ""
-            return "{:.{p}f}".format(v * (1000.0 if mm else 1.0), p=prec)
-
-        row = [
-            str(self.epoch),
-            _fmt(g_abs_rel), _fmt(g_rmse), _fmt(g_rmse, mm=True, prec=3),
-            _fmt(s_abs_rel), _fmt(s_rmse), _fmt(s_rmse, mm=True, prec=3),
-            _fmt(d1, prec=4), _fmt(d2, prec=4), _fmt(d5, prec=4),
-            _fmt(s_rmse_medscaled_mm, prec=3), _fmt(s_relief_rmse_mm, prec=3),
-        ]
+        vals = suite_avg.get("img_ms")
+        if vals is None:
+            row = [str(self.epoch)] + [""] * 7
+        else:
+            row = [str(self.epoch)] + ["{:.6f}".format(float(v)) for v in vals]
 
         write_header = not os.path.isfile(csv_path)
         with open(csv_path, "a") as f:
