@@ -1,0 +1,12 @@
+Comparison: npy vs decoded RGBA float32 PNG
+NPY file: /home/dilan/msc_research/StoneDepthTrain/test_results/npy/0003.npy
+PNG file: /home/dilan/msc_research/StoneDepthTrain/stone_syn_dataset/data_depth_annotated/train/groundtruth_float32png/stone_02/depth_0003.png
+Valid pixels: 589824 / 589824
+Mean diff: 0.0058688692
+MAE: 0.0073922288
+RMSE: 0.0090131117
+p50 abs diff: 0.0084275156
+p90 abs diff: 0.0124293864
+p95 abs diff: 0.0129869580
+p99 abs diff: 0.0148511809
+max abs diff: 0.2634705305
