@@ -75,10 +75,10 @@ class StoneDataset(MonoDatasetMultiCam):
         self.use_scale_aug = use_scale_aug
         self.scale_aug_max = float(scale_aug_max)
         self.scale_aug_prob = float(scale_aug_prob)
-        # Turntable is a closed 360 deg loop, so wide MVS source offsets (e.g. -8/+8)
-        # can index past frame 1 or the last frame. When cyclic_frames is on, source
-        # frame indices wrap modulo frames_per_seq so any offset always resolves to a
-        # real file. Only source colours are wrapped (target/mask/GT stay in range).
+        # Turntable is a closed 360 deg loop, so wide source offsets can index past
+        # frame 1 or the last frame. When cyclic_frames is on, source frame indices
+        # wrap modulo frames_per_seq so any offset always resolves to a real file.
+        # Only source colours are wrapped (target/mask/GT stay in range).
         self.cyclic_frames = bool(cyclic_frames)
         self.frames_per_seq = int(frames_per_seq)
         self.interp_mask = Image.NEAREST  # keep masks discrete (no interpolation blending)
@@ -297,7 +297,7 @@ class StoneDataset(MonoDatasetMultiCam):
             del inputs[("mask", 0, -1)]  # remove native-resolution mask PIL entry
 
         # Optional per-folder metric turntable-axis distance (6th intrinsics column).
-        # Exposed as a scalar tensor so the known-pose warp / MVS can use the true
+        # Exposed as a scalar tensor so the known-pose warp can use the true
         # absolute scale instead of a GT-median estimate.
         axis_map = getattr(self, "axis_depth_map", None)
         if axis_map and folder in axis_map:
@@ -418,7 +418,7 @@ class StoneDataset(MonoDatasetMultiCam):
         Values are *normalized* by image width/height, so they are resolution-independent.
         We convert them into a 3x4 matrix format used throughout the project. An
         optional 6th column gives the per-folder metric camera-to-turntable-axis
-        distance in metres, used by the known-pose warp / MVS for correct absolute
+        distance in metres, used by the known-pose warp for correct absolute
         scale. When absent, the trainer falls back to a GT-median estimate.
         """
         lines = self._read_lines(file_name)  # read all lines from file
