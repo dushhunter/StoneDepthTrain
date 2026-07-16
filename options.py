@@ -448,6 +448,11 @@ class MonodepthOptions:
                                  type=int,
                                  help="step size of the scheduler",
                                  default=15)
+        self.parser.add_argument("--use_cosine_lr",
+                                 action="store_true",
+                                 help=("use CosineAnnealingLR (decays smoothly over num_epochs) instead of "
+                                       "StepLR. Prevents the held-out metric from peaking early then diverging "
+                                       "at a constant LR; anneals the model into its optimum."))
 
         # ABLATION options
         self.parser.add_argument("--v1_multiscale",
