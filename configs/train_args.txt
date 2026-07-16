@@ -6,16 +6,18 @@
 --width 1024
 --batch_size 1
 --accumulation_steps 8
---num_epochs 60
+--num_epochs 30
 --frame_ids 0 -1 1
 --min_depth 0.30
 --max_depth 1.00
---learning_rate 1e-4
+--learning_rate 5e-5
 --scheduler_step_size 40
+--use_cosine_lr
+--backbone dinov2_vitb14
 --model_dim 32
 --query_nums 64
 --patch_size 16
---dim_out 512
+--dim_out 1024
 --decoder_norm group
 --prob_temperature 1.0
 --edge_refine_channels 32
@@ -28,14 +30,15 @@
 --gt_depth_path /home/dilan/msc_research/StoneDepthTrain/stone_syn_dataset
 --gt_depth_subdir data_depth_annotated/train/groundtruth_float32png
 --gt_depth_encoding float32_rgba
---gt_depth_weight 1.0
+--gt_depth_weight 0.3
 --use_berhu_loss
---gt_silog_weight 0.0
+--gt_silog_weight 1.0
 --gt_grad_weight 1.0
 --gt_normal_weight 0.2
 --gt_relief_weight 1.0
 --gt_curvature_weight 0.1
---gt_plane_weight 2.0
+--gt_plane_weight 0.0
+--select_on_medscaled
 --use_mask
 --stone_loss_weight 3.0
 --boundary_loss_weight 3.0
