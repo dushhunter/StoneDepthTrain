@@ -661,6 +661,20 @@ class MonodepthOptions:
                                  help=("skip background-plane anchoring at inference and save the raw network "
                                        "depth (the model is trained to be metric on its own on the fixed rig). "
                                        "The saved npy/<name>.npy is then the direct metric network output."))
+        self.parser.add_argument("--edge_upsample",
+                                 action="store_true",
+                                 help=("sharpen the stone silhouette with an edge-preserving guided-filter "
+                                       "upsample (guided by the full-res image). Non-destructive: applies a "
+                                       "local affine to the depth so the absolute metric scale is preserved. "
+                                       "Needs no GT; safe for single-image / test_results runs."))
+        self.parser.add_argument("--edge_upsample_radius",
+                                 type=int,
+                                 default=8,
+                                 help="guided-filter window radius for --edge_upsample.")
+        self.parser.add_argument("--edge_upsample_eps",
+                                 type=float,
+                                 default=1e-3,
+                                 help="guided-filter regularization (edge-preservation strength) for --edge_upsample.")
         self.parser.add_argument("--frames_per_seq", type=int, default=120)
         self.parser.add_argument("--intrinsics_file_path", type=str, default="",
                                  help="per-folder KV intrinsics file (same format as training)")
