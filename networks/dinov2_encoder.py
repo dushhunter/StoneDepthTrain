@@ -40,10 +40,28 @@ class DINOv2Encoder(nn.Module):
             raise ImportError("timm is required for the DINOv2 encoder")
         model_name = _DINOV2_ALIASES.get(backbone, backbone)
         # num_classes=0 -> no classifier head; we use the patch tokens directly.
-        self.vit = create_model(model_name, pretrained=pretrained, num_classes=0)
+        # dynamic_img_size=True lets the ViT accept input sizes other than its native
+        # 518x518 (it interpolates the positional embeddings); otherwise timm's
+        # patch_embed asserts H==img_size and crashes on our 576x1024 crops.
+        try:
+            self.vit = create_model(model_name, pretrained=pretrained,
+                                    num_classes=0, dynamic_img_size=True)
+        except TypeError:
+            # Older timm without dynamic_img_size: fall back and rely on the input
+            # being resized to the native size in forward().
+            self.vit = create_model(model_name, pretrained=pretrained, num_classes=0)
+            self._dynamic_img_size = False
+        else:
+            self._dynamic_img_size = True
         self.patch = self.vit.patch_embed.patch_size
         if isinstance(self.patch, (tuple, list)):
             self.patch = self.patch[0]
+        # Native training resolution of the ViT (e.g. 518 for DINOv2); used to resize
+        # the input only when dynamic image size is unavailable.
+        native = getattr(self.vit.patch_embed, "img_size", None)
+        if isinstance(native, (tuple, list)):
+            native = native[0]
+        self.native_img_size = int(native) if native else 518
         self.num_prefix = int(getattr(self.vit, "num_prefix_tokens", 1))
         embed = int(getattr(self.vit, "embed_dim", getattr(self.vit, "num_features", 384)))
         self.out_stride = int(out_stride)
@@ -74,9 +92,14 @@ class DINOv2Encoder(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # ViT needs input sizes that are a multiple of the patch size.
-        newH = max(self.patch, (H // self.patch) * self.patch)
-        newW = max(self.patch, (W // self.patch) * self.patch)
+        if getattr(self, "_dynamic_img_size", True):
+            # ViT needs input sizes that are a multiple of the patch size; dynamic
+            # img size handles arbitrary (patch-aligned) resolutions.
+            newH = max(self.patch, (H // self.patch) * self.patch)
+            newW = max(self.patch, (W // self.patch) * self.patch)
+        else:
+            # Older timm: the ViT only accepts its native square resolution.
+            newH = newW = (self.native_img_size // self.patch) * self.patch
         xr = F.interpolate(x, size=(newH, newW), mode="bilinear", align_corners=False)
         tokens = self._patch_tokens(xr)                 # [B, h*w, embed]
         h, w = newH // self.patch, newW // self.patch
