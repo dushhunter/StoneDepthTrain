@@ -1,8 +1,8 @@
---model_type cvnxt_L
---backbone convnext_large
+--model_type dinov2
+--backbone dinov2_vitb14
 --model_dim 32
 --patch_size 16
---dim_out 512
+--dim_out 1024
 --query_nums 64
 --dec_channels 1024 512 256 128
 --min_depth 0.30
@@ -16,4 +16,6 @@
 --ext png
 --height 576
 --width 1024
---no_anchor
+--gt_scale
+--gt_depth_dir /home/dilan/msc_research/StoneDepthTrain/stone_syn_dataset/data_depth_annotated/train/groundtruth_float32png/stone_11
+--gt_depth_encoding float32_rgba
