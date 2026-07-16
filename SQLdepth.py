@@ -32,10 +32,6 @@ class SQLdepth(nn.Module):
             self.encoder = networks.Unet(pretrained=(not opt.load_pretrained_model), backbone='convnext_large', in_channels=3, num_classes=opt.model_dim, decoder_channels=opt.dec_channels, decoder_norm=decoder_norm)
         elif opt.backbone in ["resnet", "resnet_lite"]:
             self.encoder = networks.ResnetEncoderDecoder(num_layers=self.opt.num_layers, num_features=self.opt.num_features, model_dim=self.opt.model_dim)
-        elif networks.is_dinov2_backbone(opt.backbone):
-            self.encoder = networks.DINOv2Encoder(
-                backbone=opt.backbone, model_dim=opt.model_dim,
-                pretrained=(not opt.load_pretrained_model))
         elif opt.model_type in ["nyu_pth_model", "eff_b5"]:
             self.encoder = BaseEncoder.build(num_features=opt.num_features, model_dim=opt.model_dim)
         else:
@@ -660,47 +656,16 @@ class MonodepthOptions:
                                  default=100000.0,
                                  help="uint16 GT PNG -> metres divisor (only used when --gt_depth_encoding uint16).")
 
-        # ---- Cost-volume MVS inference (test_mvs.py) ----
-        self.parser.add_argument("--use_mvs",
-                                 help="load and run the cost-volume MVS head instead of the monocular head",
-                                 action="store_true")
-        self.parser.add_argument("--mvs_frame_offsets",
-                                 nargs="+", type=int,
-                                 help="turntable frame offsets used as MVS source views (e.g. -8 -4 4 8)",
-                                 default=[-8, -4, 4, 8])
         self.parser.add_argument("--no_anchor",
                                  action="store_true",
                                  help=("skip background-plane anchoring at inference and save the raw network "
                                        "depth (the model is trained to be metric on its own on the fixed rig). "
                                        "The saved npy/<name>.npy is then the direct metric network output."))
-        self.parser.add_argument("--distill_out",
-                                 type=str, default="",
-                                 help=("output root for MVS teacher labels. Depth maps are written as "
-                                       "<distill_out>/<stone>/depth_XXXX.png (uint16, mm) so the monocular "
-                                       "trainer can consume them via --gt_depth_path <distill_out> "
-                                       "--gt_depth_subdir '' --gt_depth_encoding uint16 --gt_depth_scale 1000."))
-        self.parser.add_argument("--distill_folders",
-                                 nargs="+", type=str, default=[],
-                                 help=("stone folders to label (e.g. stone_01 stone_02). If empty, the unique "
-                                       "folders in splits/<split>/train_files.txt are used."))
-        self.parser.add_argument("--mvs_seq_path",
-                                 type=str, default="",
-                                 help=("full turntable sequence folder (all NNNN.png frames of ONE stone) that "
-                                       "provides the source neighbour views and the intrinsics folder key. Use "
-                                       "this when --image_path holds only a few reference frames (e.g. "
-                                       "test_results): the reference frame is read from --image_path but its "
-                                       "MVS neighbours come from here. If empty, --image_path is used for both."))
-        self.parser.add_argument("--mvs_num_depth_coarse", type=int, default=48)
-        self.parser.add_argument("--mvs_num_depth_fine", type=int, default=48)
-        self.parser.add_argument("--mvs_fine_range_mm", type=float, default=20.0)
-        self.parser.add_argument("--mvs_feature_ch", type=int, default=32)
-        self.parser.add_argument("--mvs_num_groups", type=int, default=8)
-        self.parser.add_argument("--mvs_feat_scale", type=int, default=8)
         self.parser.add_argument("--frames_per_seq", type=int, default=120)
         self.parser.add_argument("--intrinsics_file_path", type=str, default="",
                                  help="per-folder KV intrinsics file (same format as training)")
         self.parser.add_argument("--use_known_pose", action="store_true",
-                                 help="use deterministic turntable transforms for the MVS warp")
+                                 help="use deterministic turntable transforms for the known-pose warp")
         self.parser.add_argument("--turntable_angle_deg", type=float, default=3.0)
         self.parser.add_argument("--turntable_axis_depth", type=float, default=-1.0)
         self.parser.add_argument("--turntable_axis_offset_x", type=float, default=0.0)
