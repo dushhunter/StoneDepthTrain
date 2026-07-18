@@ -1,4 +1,4 @@
-# StoneVolMain — Stone Depth Estimation
+## StoneVolMain — Stone Depth Estimation
 
 ## Quick Start
 
